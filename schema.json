@@ -80,6 +80,18 @@
         "default": "contains",
         "name": "停止词匹配方式",
         "hint": "contains=消息包含停止词即命中；exact=整条消息完全等于停止词；regex=按正则匹配。"
+      },
+      "stop_whitelist_enabled": {
+        "type": "switch",
+        "default": false,
+        "name": "停止词用户白名单",
+        "hint": "默认关闭=任何人发停止词都能停。开启后，只有名单内用户发的停止词才会停止本轮，其他人发停止词无效。"
+      },
+      "stop_whitelist_users": {
+        "type": "list",
+        "default": [],
+        "name": "允许触发停止的用户ID",
+        "hint": "填用户ID（user_id），仅在上方白名单开启时生效。和「范围与白名单」里的流入白名单互不影响，独立控制。"
       }
     }
   },
