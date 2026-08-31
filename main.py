@@ -302,6 +302,24 @@ class MidflightMessagePlugin(BasePlugin):
 
         base = getattr(tool_result, "text", "") or ""
         tool_result.text = (base + "\n" if base else "") + inject_block
+
+        # 媒体附件透传：native 多模态模式下官方文本化只产出 "[Image attached]"，
+        # 图片字节不会随搭车文本进请求。把消息里的 Image/Record/File 元素挂到
+        # ToolResult.attachments（官方支持，tool.py:60），assemble_result 会自动
+        # 落盘并把可访问路径写进工具结果，bot 后续可直接读取原图/原文件。
+        # 与 S版/Z版 的并行媒体识别兼容：它们已替换为占位/描述文本的链里不再含
+        # 原始媒体元素，此处自然为空，互不影响。
+        try:
+            attachments = getattr(tool_result, "attachments", None)
+            if isinstance(attachments, list):
+                for msg_event, _ in injectable:
+                    chain = getattr(getattr(msg_event, "message", None), "chain", None) or []
+                    for ele in chain:
+                        if isinstance(ele, (Image, Record, File)) and hasattr(ele, "to_path"):
+                            attachments.append(ele)
+        except Exception:
+            self._log_debug("媒体附件透传失败（已忽略，不影响文本流入）")
+
         logger.info(f"[Midflight] {sid} 流入 {len(injectable)} 条消息到当前轮")
 
     # ============ 去重兜底：掐掉完全重复的批次 ============
