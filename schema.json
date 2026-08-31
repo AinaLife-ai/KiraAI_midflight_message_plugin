@@ -1,0 +1,195 @@
+{
+  "section_basic": {
+    "type": "section",
+    "name": "基础",
+    "collapsed": false,
+    "fields": {
+      "enabled": {
+        "type": "switch",
+        "default": true,
+        "name": "启用消息流入",
+        "hint": "总开关。关闭后插件完全不影响任何消息处理。"
+      },
+      "inject_timeout_steps": {
+        "type": "integer",
+        "default": 2,
+        "name": "流入等待步数上限",
+        "hint": "候选消息等待工具调用边界的最大步数；超过则按原样留给聊天插件开新轮（0=一直等）。防止 bot 不再调工具时消息滞留。"
+      },
+      "debug": {
+        "type": "switch",
+        "default": false,
+        "name": "调试日志",
+        "hint": "开启后输出更详细的运行日志，排查问题时使用。"
+      }
+    }
+  },
+  "section_flow": {
+    "type": "section",
+    "name": "消息流入方式",
+    "collapsed": false,
+    "fields": {
+      "flow_method_group": {
+        "type": "enum",
+        "options": ["all", "at", "reply", "keyword", "any"],
+        "default": "all",
+        "name": "群聊流入方式",
+        "hint": "all=@机器人/回复机器人/含唤醒词/戳一戳 任一即可流入；at=仅@；reply=仅回复；keyword=仅唤醒词；any=任意消息都流入"
+      },
+      "flow_method_dm": {
+        "type": "enum",
+        "options": ["all", "at", "reply", "keyword", "any"],
+        "default": "any",
+        "name": "私聊流入方式",
+        "hint": "私聊默认 any：任何消息都可流入。"
+      },
+      "accept_poke": {
+        "type": "switch",
+        "default": true,
+        "name": "戳一戳也算流入触发",
+        "hint": "all 模式下，戳一戳（poke）与@/回复/唤醒词并列。"
+      },
+      "wake_keywords": {
+        "type": "list",
+        "default": [],
+        "name": "唤醒词列表",
+        "hint": "留空 = 自动沿用聊天插件的唤醒关键词（按 Z版chat → S版chat → 官方默认聊天 的顺序读取已安装插件的配置）。填写则以本列表为准。"
+      }
+    }
+  },
+  "section_stop": {
+    "type": "section",
+    "name": "停止词",
+    "collapsed": false,
+    "fields": {
+      "stop_enabled": {
+        "type": "switch",
+        "default": false,
+        "name": "启用停止词",
+        "hint": "默认关闭。开启后，命中停止词的消息会在下一个工具边界停止本轮后续步骤；bot 已完成的步骤和聊天上下文保留，之后随时可以正常继续交流。"
+      },
+      "stop_words": {
+        "type": "list",
+        "default": ["停", "停止", "取消", "别做了", "停下", "stop", "cancel"],
+        "name": "停止词列表",
+        "hint": "在 bot 连续执行期间命中即停止后续步骤。"
+      },
+      "stop_match_mode": {
+        "type": "enum",
+        "options": ["contains", "exact", "regex"],
+        "default": "contains",
+        "name": "停止词匹配方式",
+        "hint": "contains=消息包含停止词即命中；exact=整条消息完全等于停止词；regex=按正则匹配。"
+      }
+    }
+  },
+  "section_scope": {
+    "type": "section",
+    "name": "范围与白名单",
+    "collapsed": true,
+    "fields": {
+      "session_blacklist": {
+        "type": "list",
+        "default": [],
+        "name": "会话黑名单",
+        "hint": "格式 adapter:dm|gm:id，支持 adapter:gm:* 通配。留空=全部会话生效。"
+      },
+      "whitelist_enabled": {
+        "type": "switch",
+        "default": false,
+        "name": "启用用户白名单",
+        "hint": "默认关闭：所有群友/私聊用户的消息都能流入。开启后仅下列用户可流入。"
+      },
+      "whitelist_users": {
+        "type": "list",
+        "default": [],
+        "name": "允许流入的用户 ID",
+        "hint": "平台原生用户 ID（如 QQ 号），仅白名单开启时生效。"
+      }
+    }
+  },
+  "section_limits": {
+    "type": "section",
+    "name": "数量与时间窗口",
+    "collapsed": true,
+    "fields": {
+      "max_inject_per_run": {
+        "type": "integer",
+        "default": 0,
+        "name": "单轮最多流入条数",
+        "hint": "0 = 自动读取配置里的最大消息缓冲条数（bot_config.bot.max_buffer_messages）。达到上限后，后续消息按原样留给聊天插件开新轮。"
+      },
+      "freshness_seconds": {
+        "type": "integer",
+        "default": 0,
+        "name": "流入消息新鲜度（秒）",
+        "hint": "0 = 自动读取配置里的最大消息合并间隔（bot_config.bot.max_message_interval）。只流入距当前工具边界 N 秒内到达的消息，防止陈旧消息误注入。"
+      },
+      "max_length": {
+        "type": "integer",
+        "default": 0,
+        "name": "单条流入最大长度",
+        "hint": "0 = 不限长度；大于 0 时超出部分截断。"
+      },
+      "block_patterns": {
+        "type": "list",
+        "default": [],
+        "name": "内容正则黑名单",
+        "hint": "命中即不流入，按普通消息走官方管线。"
+      }
+    }
+  },
+  "section_inject": {
+    "type": "section",
+    "name": "注入格式（高级）",
+    "collapsed": true,
+    "fields": {
+      "template": {
+        "type": "textarea",
+        "default": "",
+        "name": "自定义注入模板",
+        "hint": "默认留空 = 使用与平时聊天完全一致的原生消息样式，bot 感知不到差别。仅高级用户自定义，可用变量 {sender_nickname} {text} {time} {n}。"
+      }
+    }
+  },
+  "section_media": {
+    "type": "section",
+    "name": "媒体流入",
+    "collapsed": true,
+    "fields": {
+      "allow_record": {
+        "type": "switch", "default": true,
+        "name": "允许语音消息流入",
+        "hint": "语音由官方 STT 转写成文字后流入（[Record 转写文本]），与平时聊天完全一致。需已配置默认 STT 模型。"
+      },
+      "allow_image": {
+        "type": "switch", "default": true,
+        "name": "允许图片/表情包流入",
+        "hint": "图片由官方 VLM 生成描述并落盘，流入内容为 [Image 描述, file_path: ...]，bot 后续可用文件工具读取原图。"
+      },
+      "allow_file": {
+        "type": "switch", "default": true,
+        "name": "允许文件/视频流入",
+        "hint": "文件/视频的落盘大小阈值完全跟随官方行为（当前官方硬编码 10MB，超过仅流入文件名提示；官方将来调整则自动跟随）。"
+      },
+      "allow_forward": {
+        "type": "switch", "default": true,
+        "name": "允许合并转发流入",
+        "hint": "合并转发内容会被递归展开后流入。"
+      }
+    }
+  },
+  "section_overrides": {
+    "type": "section",
+    "name": "会话级覆盖（高级）",
+    "collapsed": true,
+    "fields": {
+      "overrides": {
+        "type": "json",
+        "default": {},
+        "name": "按会话覆盖配置",
+        "hint": "例：{\"qq:gm:123456\": {\"flow_method_group\": \"any\"}}，键支持 adapter:gm:* 通配。默认空，不配置完全不影响使用。"
+      }
+    }
+  }
+}
