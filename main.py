@@ -40,7 +40,7 @@ FALLBACK_FRESHNESS = 30
 FALLBACK_ACTIVE_TIMEOUT = 180.0
 # 默认流入引导语：让 bot 意识到可以边回边干（KiraAI 每个 LLM 步都会把
 # <msg> 文本响应即时发出，所以中间步回复用户是原生支持的）
-DEFAULT_INJECT_HINT = "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  等回一两句。）"
+DEFAULT_INJECT_HINT = "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  方式回一两句。）"
 # 唤醒词回退链：按序尝试读取已安装聊天插件的唤醒词配置
 # （plugin_id 候选, 可能的配置键）
 WAKE_KEYWORD_SOURCES = [

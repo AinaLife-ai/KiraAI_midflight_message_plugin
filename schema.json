@@ -158,7 +158,7 @@
       },
       "inject_hint_text": {
         "type": "textarea",
-        "default": "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  等回一两句。）",
+        "default": "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  方式回一两句。）",
         "name": "引导语内容",
         "hint": "留空 = 用默认引导语。改它可以调整 bot 边回边干的积极性。"
       }
