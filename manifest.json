@@ -1,0 +1,16 @@
+{
+  "plugin_id": "midflight_message_plugin",
+  "display_name": "Midflight Inbox",
+  "version": "1.0.0",
+  "author": "znq19",
+  "description": "连续步数消息流入：bot 连续执行期间，把恰好到达的新消息在每个工具调用边界以原生样式送进当前轮，支持停止词即时叫停。零拦截，不打断聊天插件的防抖与合并。",
+  "repo": "https://github.com/znq19/KiraAI_midflight_message_plugin",
+  "tags": ["chat", "agent", "message", "utility"],
+  "core_version": ">=2.29.7",
+  "locales": {
+    "zh": {
+      "display_name": "连续步数消息流入",
+      "description": "连续步数消息流入：bot 连续执行期间，把恰好到达的新消息在每个工具调用边界以原生样式送进当前轮，支持停止词即时叫停。零拦截，不打断聊天插件的防抖与合并。"
+    }
+  }
+}
