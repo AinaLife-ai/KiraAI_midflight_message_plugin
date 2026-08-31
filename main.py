@@ -1,4 +1,4 @@
-"""连续步数消息流入插件（Midflight Inbox）
+"""随时插话（Midflight Inbox）
 
 核心哲学：零拦截、自然流入。
 - 不改变任何消息的处理策略，不打断聊天插件的防抖/合并；
@@ -48,7 +48,7 @@ OVERRIDABLE_KEYS = {
 
 
 class MidflightMessagePlugin(BasePlugin):
-    """连续步数消息流入插件主类"""
+    """随时插话插件主类"""
 
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
