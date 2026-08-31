@@ -40,7 +40,11 @@ FALLBACK_FRESHNESS = 30
 FALLBACK_ACTIVE_TIMEOUT = 180.0
 # 默认流入引导语：让 bot 意识到可以边回边干（KiraAI 每个 LLM 步都会把
 # <msg> 文本响应即时发出，所以中间步回复用户是原生支持的）
-DEFAULT_INJECT_HINT = "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  方式回一两句。）"
+DEFAULT_INJECT_HINT = (
+    "（以上是任务途中收到的新消息。回复规则：如果新消息需要你回应，必须在本轮回复中先输出 "
+    "<msg><text>回应内容</text></msg>，再继续调用工具——发消息和继续任务在同一轮里同时进行，"
+    "不要等任务结束才回。如果新消息不需要回应，直接继续任务即可。）"
+)
 # 唤醒词回退链：按序尝试读取已安装聊天插件的唤醒词配置
 # （plugin_id 候选, 可能的配置键）
 WAKE_KEYWORD_SOURCES = [
@@ -205,10 +209,11 @@ class MidflightMessagePlugin(BasePlugin):
         self._log_debug(f"运行中判定超时: {self._active_timeout}s")
 
         logger.info(
-            f"[Midflight] 消息流入插件已加载 | enabled={self.enabled} "
+            f"[Midflight] 随时插话 v{self._self_version()} 已加载 | enabled={self.enabled} "
             f"群聊={self.flow_method_group} 私聊={self.flow_method_dm} "
             f"poke={self.accept_poke} 停止词={'开' if self.stop_enabled else '关(默认)'} "
-            f"上限={self._eff_max_inject} 新鲜度={self._eff_freshness}s"
+            f"上限={self._eff_max_inject} 新鲜度={self._eff_freshness}s "
+            f"引导语={'开' if self.inject_hint else '关'}"
         )
 
     async def terminate(self):
@@ -989,6 +994,17 @@ class MidflightMessagePlugin(BasePlugin):
                 group_name=group_name, group_id=group_id)
         except Exception:
             return text
+
+    @staticmethod
+    def _self_version() -> str:
+        """动态读取同目录 manifest.json 的版本号（启动日志用，杜绝硬编码漂移）。"""
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            m = _json.loads((_Path(__file__).parent / "manifest.json").read_text(encoding="utf-8"))
+            return str(m.get("version") or "?")
+        except Exception:
+            return "?"
 
     def _read_core_config(self, key: str):
         try:
