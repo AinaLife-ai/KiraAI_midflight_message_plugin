@@ -14,7 +14,7 @@
         "type": "integer",
         "default": 2,
         "name": "流入等待步数上限",
-        "hint": "候选消息等待工具调用边界的最大步数；超过则按原样留给聊天插件开新轮（0=一直等）。防止 bot 不再调工具时消息滞留。"
+        "hint": "消息可被用于流入工具调用时的最大轮数（0＝无限）。即超过该值之前存在的消息不会再下一次工具调用时可以流入，但仍可以被消息缓冲或聊天插件新处理。一般不用修改除非使用时很不符合你的预期。"
       },
       "debug": {
         "type": "switch",
@@ -148,7 +148,7 @@
         "type": "textarea",
         "default": "",
         "name": "自定义注入模板",
-        "hint": "默认留空 = 使用与平时聊天完全一致的原生消息样式，bot 感知不到差别。仅高级用户自定义，可用变量 {sender_nickname} {text} {time} {n}。"
+        "hint": "默认留空 = 使用与平时聊天完全一致的官方格式（[时间] [message_id: x] [user_nickname: x, user_id: x] | 内容，群聊另带群名/群号），bot 感知不到差别。仅高级用户自定义，可用变量 {sender_nickname} {user_id} {message_id} {group_name} {group_id} {text} {time} {n}。"
       }
     }
   },

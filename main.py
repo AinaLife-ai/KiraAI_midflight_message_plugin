@@ -2,12 +2,18 @@
 
 核心哲学：零拦截、自然流入。
 - 不改变任何消息的处理策略，不打断聊天插件的防抖/合并；
-- 只是在 bot 连续执行的每个工具调用边界（ON_TOOL_RESULT），把该会话
-  SessionBuffer 里"恰好已到达、还没来得及成为下一轮"的消息，以与官方批次
-  完全一致的原生样式追加进 tool_result.text，让下一步 LLM 直接读到；
-- 被过滤掉的消息会原样放回 buffer，照常走聊天插件开新轮，没有消息会被卡住；
+- 流入通道有两条，互为补充：
+  1) 工具边界 drain：在 bot 连续执行的每个工具调用边界（ON_TOOL_RESULT），
+     把该会话 SessionBuffer 里"恰好已到达、还没来得及成为下一轮"的消息，
+     以与官方内置 kira-ai 插件完全一致的格式（[时间] [message_id] [昵称, user_id] | 内容）
+     追加进 tool_result.text；
+  2) 批次拦截：若消息先被聊天插件防抖 flush 成批次（如 S版 QueueMerge 会把
+     运行中到达的批次扣进 pending 排队），则在 ON_IM_BATCH_MESSAGE(SYS_HIGH，
+     先于 QueueMerge 的 HIGH) 识别"本会话正在跑"，直接把批次消息转入流入队列，
+     掐掉批次，等下一个工具边界注入——消息不再被排队到本轮结束后；
+- 被过滤掉的消息会原样放回 buffer / 放行批次，照常走聊天插件开新轮；
 - 已消费 message_id 去重（TTL 10 分钟），若已注入消息又被 flush 成新批次，
-  在 ON_IM_BATCH_MESSAGE(HIGH) 掐掉完全重复的批次，防止二次回复。
+  掐掉完全重复的批次，防止二次回复。
 
 仅使用官方插件 API，不修改 KiraAI 本体。
 """
@@ -15,6 +21,7 @@
 import fnmatch
 import re
 import time
+from datetime import datetime
 
 from core.plugin import BasePlugin, logger, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
@@ -29,6 +36,8 @@ DEDUP_TTL = 600
 # 自动读取官方配置失败时的保守内置兜底
 FALLBACK_MAX_INJECT = 5
 FALLBACK_FRESHNESS = 30
+# “运行中”判定的兜底超时（秒）：自动 = LLM 超时 + 工具超时（与 S版 QueueMerge 同源公式）
+FALLBACK_ACTIVE_TIMEOUT = 180.0
 # 唤醒词回退链：按序尝试读取已安装聊天插件的唤醒词配置
 # （plugin_id 候选, 可能的配置键）
 WAKE_KEYWORD_SOURCES = [
@@ -48,6 +57,27 @@ OVERRIDABLE_KEYS = {
     "freshness_seconds", "max_length", "block_patterns", "template",
     "inject_timeout_steps", "debug",
 }
+
+
+class _BufferedMsgShim:
+    """把批次里的 KiraIMMessage 包装成与 buffer 中 KiraMessageEvent 相同的访问形状
+    （.message / .is_group_message() / .message_types / .adapter / .session），
+    使批次拦截路径与 buffer drain 路径可以走完全相同的过滤与注入代码。"""
+
+    __slots__ = ("message", "message_types", "adapter", "session", "_is_group")
+
+    def __init__(self, message, batch_event):
+        self.message = message
+        self.message_types = getattr(batch_event, "message_types", None)
+        self.adapter = getattr(batch_event, "adapter", None)
+        self.session = getattr(batch_event, "session", None)
+        try:
+            self._is_group = bool(batch_event.is_group_message())
+        except Exception:
+            self._is_group = getattr(message, "group", None) is not None
+
+    def is_group_message(self):
+        return self._is_group
 
 
 class MidflightMessagePlugin(BasePlugin):
@@ -105,11 +135,16 @@ class MidflightMessagePlugin(BasePlugin):
         self._run_inject_count: dict[str, int] = {}
         # {sid: 有候选消息但未被消费的连续工具边界数}
         self._wait_steps: dict[str, int] = {}
+        # {sid: {"event": 运行中的批次事件对象, "ts": 最近心跳, "ending": 末步标记}}
+        self._run_active: dict[str, dict] = {}
+        # {sid: [(批次消息 shim, 纯文本, 入队时间)]} —— 批次拦截来的待注入消息
+        self._pending_inject: dict[str, list] = {}
         # 上次清理时间
         self._last_gc: float = 0.0
         # 自动解析后的生效值（initialize 中解析）
         self._eff_max_inject: int = 0
         self._eff_freshness: int = 0
+        self._active_timeout: float = FALLBACK_ACTIVE_TIMEOUT
 
     # ============ 生命周期 ============
 
@@ -150,6 +185,20 @@ class MidflightMessagePlugin(BasePlugin):
             else:
                 self._log_debug("未能从任何聊天插件读取唤醒词，keyword 流入通道不生效")
 
+        # “运行中”判定超时：自动 = LLM 超时 + 工具调用超时（与 S版 QueueMerge 同源），
+        # 覆盖“两次心跳之间最多夹一次 LLM 调用 + 一轮工具执行”的最长无活动窗口
+        try:
+            llm_timeout = 120.0
+            client = self.ctx.get_default_llm_client()
+            if client is not None:
+                mc = getattr(getattr(client, "model", None), "model_config", None) or {}
+                llm_timeout = float(mc.get("timeout", 120) or 120)
+            tool_timeout = float(self._read_core_config("bot_config.agent.tool_call_timeout") or 60)
+            self._active_timeout = llm_timeout + tool_timeout
+        except Exception:
+            self._active_timeout = FALLBACK_ACTIVE_TIMEOUT
+        self._log_debug(f"运行中判定超时: {self._active_timeout}s")
+
         logger.info(
             f"[Midflight] 消息流入插件已加载 | enabled={self.enabled} "
             f"群聊={self.flow_method_group} 私聊={self.flow_method_dm} "
@@ -163,6 +212,8 @@ class MidflightMessagePlugin(BasePlugin):
             self._consumed.clear()
             self._run_inject_count.clear()
             self._wait_steps.clear()
+            self._run_active.clear()
+            self._pending_inject.clear()
             self._last_gc = 0.0
         except Exception:
             pass
@@ -197,8 +248,21 @@ class MidflightMessagePlugin(BasePlugin):
             self._log_debug(f"{sid} 在会话黑名单中，跳过")
             return
 
+        # 运行心跳：tool_result 触发即证明该 sid 的 agent 轮仍在执行
+        self._touch_run(sid, event)
+
+        # 末步标记（最后一步仍带工具调用）：本边界之后不会再有 LLM 调用，
+        # 注入会丢，直接收尾并把待注入消息还原走正常管线
+        run = self._run_active.get(sid)
+        if run and run.get("ending"):
+            self._log_debug(f"{sid} 末步工具边界，不再注入，收尾还原")
+            await self._finish_run(sid)
+            return
+
+        queued = [item[0] for item in self._pending_inject.pop(sid, [])]
+
         buffer = self.ctx.get_buffer(sid)
-        if buffer is None or buffer.get_length() == 0:
+        if (buffer is None or buffer.get_length() == 0) and not queued:
             self._wait_steps.pop(sid, None)
             return
 
@@ -206,14 +270,24 @@ class MidflightMessagePlugin(BasePlugin):
         timeout = cfg["inject_timeout_steps"]
         waited = self._wait_steps.get(sid, 0)
         if timeout > 0 and waited >= timeout:
+            if queued and buffer is not None:
+                # 批次拦截来的消息等超了：还原回 buffer 走正常管线，绝不卡住
+                async with buffer.lock:
+                    buffer.buffer[:0] = queued
+                self._log_debug(f"{sid} 拦截消息等待超上限，已还原回 buffer")
             self._log_debug(f"{sid} 候选消息已等待 {waited} 个边界（上限 {timeout}），不再消费")
             return
 
         self._gc()
 
         # 在 buffer.lock 内 drain，与官方 flush_session_messages 同一互斥域
-        async with buffer.lock:
-            pending = buffer.flush()
+        pending = []
+        if buffer is not None:
+            async with buffer.lock:
+                pending = buffer.flush()
+
+        # 批次拦截来的消息排在 buffer 消息之前（它们到达更早、已被 flush 过）
+        pending = queued + pending
 
         if not pending:
             return
@@ -294,8 +368,10 @@ class MidflightMessagePlugin(BasePlugin):
             if cfg["template"]:
                 lines.append(self._render_template(cfg["template"], msg_event, native, n))
             else:
-                # 默认：原样流入，不改写/包装
-                lines.append(native)
+                # 默认：与官方内置 kira-ai 插件 _format_user_message 完全一致的格式
+                # 群聊: [时间] [message_id: x] [group_name: x group_id: x user_nickname: x, user_id: x] | 内容
+                # 私聊: [时间] [message_id: x] [user_nickname: x, user_id: x] | 内容
+                lines.append(self._format_native(msg_event, native))
 
         inject_block = "\n".join(line for line in lines if line)
         if not inject_block.strip():
@@ -333,33 +409,250 @@ class MidflightMessagePlugin(BasePlugin):
 
     # ============ 去重兜底：掐掉完全重复的批次 ============
 
-    @on.llm_response()
-    async def _ensure_stop_checkpoint(self, event, *_):
-        """空 handler，有意为之：agent_executor 的 is_stopped 停止检查位于
-        ON_LLM_RESPONSE handler 循环体内（agent_executor.py:149-164）。
-        若环境中没有任何插件注册该事件，循环体不执行，event.stop() 将无法
-        阻止后续 LLM 步。注册此空 handler 保证停止检查点必然被执行。"""
-        return
+    @on.llm_request()
+    async def _track_run_start(self, event, *_):
+        """ON_LLM_REQUEST 在每轮 agent 启动前触发（且只带批次事件）——
+        这是"一轮确实要开始执行"的最早可靠信号，在此标记运行开始。
+        相比在 ON_IM_BATCH_MESSAGE 放行时标记，此处标记不会被
+        session_merger 等下游 handler 拦停批次的情况污染（批次被拦 = 不会走到这里）。"""
+        try:
+            if not isinstance(event, KiraMessageBatchEvent):
+                return
+            sid = getattr(event, "sid", None) or getattr(getattr(event, "session", None), "sid", None)
+            if sid:
+                self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
+        except Exception:
+            pass
 
-    @on.im_batch_message(priority=Priority.HIGH)
+    @on.llm_response()
+    async def _ensure_stop_checkpoint(self, event, resp=None, *_):
+        """三件事：
+        1) 空 handler 兜底：agent_executor 的 is_stopped 停止检查位于
+           ON_LLM_RESPONSE handler 循环体内（agent_executor.py:149-164）。
+           若环境中没有任何插件注册该事件，循环体不执行，event.stop() 将无法
+           阻止后续 LLM 步。注册此 handler 保证停止检查点必然被执行。
+        2) 运行心跳：LLM 响应到达即证明该 sid 的 agent 轮仍在执行。
+        3) 收尾检测：无 tool_calls 的响应 = 最终文本步，本轮即将结束，
+           立即清除"运行中"标记并还原批次拦截来的待注入消息（若有）。"""
+        try:
+            sid = getattr(event, "sid", None) or getattr(getattr(event, "session", None), "sid", None)
+            if not sid:
+                return
+            run = self._run_active.get(sid)
+            if run is None or run.get("event") is not event:
+                return
+            tool_calls = getattr(resp, "tool_calls", None)
+            if not tool_calls:
+                # 最终文本步：本轮结束
+                await self._finish_run(sid)
+                return
+            run["ts"] = time.time()
+            # 末步仍带工具：该步工具执行完 agent 即结束（无最终文本步），
+            # 打标记让下一个工具边界不再注入（注入会丢），直接收尾还原
+            idx = getattr(resp, "agent_step_index", None)
+            if idx:
+                max_steps = self._to_int(self._read_core_config("bot_config.agent.max_tool_loop"), 2)
+                if max_steps > 0 and int(idx) >= max_steps:
+                    run["ending"] = True
+        except Exception:
+            logger.exception("[Midflight] llm_response 处理异常（已自捕获）")
+
+    @on.im_batch_message(priority=Priority.SYS_HIGH)
     async def on_batch_dedup(self, event: KiraMessageBatchEvent, *_):
-        """若批次内全部消息都已被本插件消费过，则掐掉该批次，避免重复开轮。"""
+        """批次守卫（必须先于 S版 QueueMerge 等 HIGH 优先级 handler 执行）：
+        1) QueueMerge 自推送批次直接放行（避免拦截它推送的积压）；
+        2) 全部消息已被本插件消费过的批次 → 掐掉，防重复开轮；
+        3) 该 sid 正在跑 agent 轮 → 批次消息不再排队：命中停止词则停止当前轮，
+           通过过滤的转入待注入队列（下一个工具边界注入），未通过的放回 buffer，
+           然后掐掉批次（阻止 QueueMerge pending / 另开平行轮）；
+        4) 该 sid 空闲 → 放行（运行开始的标记改在 ON_LLM_REQUEST 做）。
+
+        优先级说明：框架约定 SYS_HIGH 保留给系统插件，但本插件的职责就是
+        "在队列合并类插件把消息扣进 pending 之前截住运行中的批次"，
+        同优先级时执行顺序取决于插件加载顺序（os.listdir，不确定），
+        只有 SYS_HIGH 能保证确定性。框架排序按 int 比较，功能上安全。
+        """
         try:
             if not self.enabled:
                 return
             sid = getattr(event, "sid", None)
             if not sid:
                 return
-            consumed_map = self._consumed.get(sid)
-            if not consumed_map:
+
+            # QueueMerge 自推送批次（积压重放）绝对放行
+            extra = getattr(event, "extra", None) or {}
+            if extra.get("_qm_self"):
                 return
+
+            # session_merger 的跨会话控制批次（ROUTE/handoff）绝对放行：
+            # 它们携带合并上文、工具禁用等特殊语义，不是用户闲聊，不能流入
+            if extra.get("merger_handoff") or self._is_control_batch(event):
+                return
+
             messages = getattr(event, "messages", None) or []
-            ids = [str(getattr(m, "message_id", "") or "") for m in messages]
-            if ids and all(mid and mid in consumed_map for mid in ids):
-                logger.info(f"[Midflight] {sid} 批次 {getattr(event, 'event_id', '')} 全部为已消费消息，掐掉重复轮")
+
+            # 1) 全消费批次去重
+            consumed_map = self._consumed.get(sid)
+            if consumed_map and messages:
+                ids = [str(getattr(m, "message_id", "") or "") for m in messages]
+                if ids and all(mid and mid in consumed_map for mid in ids):
+                    logger.info(f"[Midflight] {sid} 批次 {getattr(event, 'event_id', '')} 全部为已消费消息，掐掉重复轮")
+                    event.stop()
+                    return
+
+            # 2) 运行中批次拦截
+            run = self._get_active_run(sid)
+            if run is None:
+                # 空闲：放行。运行开始的标记在 ON_LLM_REQUEST 做（批次被
+                # session_merger 等下游拦停时不会误标）。
+                return
+
+            if self._in_blacklist(sid) or not messages:
+                return
+
+            cfg = self._eff_config(sid)
+            now = time.time()
+            stop_hit, injectable, rejected = [], [], []
+            for m in messages:
+                shim = _BufferedMsgShim(m, event)
+                try:
+                    mid = str(getattr(m, "message_id", "") or "")
+                    if mid and consumed_map and mid in consumed_map:
+                        continue  # 部分已消费：跳过该条
+                    text = self._plain_text(shim)
+                    if cfg["stop_enabled"] and self._match_stop(text, cfg):
+                        stop_hit.append(shim)
+                        continue
+                    if self._pass_filters(shim, text, cfg, now):
+                        injectable.append((shim, text))
+                    else:
+                        rejected.append(shim)
+                except Exception:
+                    rejected.append(shim)
+                    logger.exception("[Midflight] 批次消息过滤异常，已放回原流程")
+
+            if not stop_hit and not injectable:
+                return  # 没有要消费的消息：批次原样放行给 QueueMerge / 官方
+
+            # 停止与注入互斥（与 drain 路径同一语义）
+            consumed_map = self._consumed.setdefault(sid, {})
+            buffer = self.ctx.get_buffer(sid)
+            if stop_hit:
+                put_back = rejected + [s for s, _ in injectable]
+                if put_back and buffer is not None:
+                    async with buffer.lock:
+                        buffer.buffer[:0] = put_back
+                for s in stop_hit:
+                    mid = str(getattr(getattr(s, "message", None), "message_id", "") or "")
+                    if mid:
+                        consumed_map[mid] = now
+                run["event"].stop()  # 停的是正在跑的那一轮的事件对象
                 event.stop()
+                logger.info(f"[Midflight] {sid} 批次消息命中停止词，停止当前轮")
+                return
+
+            # 注入：转入待注入队列，下一个工具边界注入
+            if rejected and buffer is not None:
+                async with buffer.lock:
+                    buffer.buffer[:0] = rejected
+            q = self._pending_inject.setdefault(sid, [])
+            for shim, text in injectable:
+                q.append((shim, text, now))
+            event.stop()
+            logger.info(f"[Midflight] {sid} 拦截运行中批次 {getattr(event, 'event_id', '')}，{len(injectable)} 条转入流入队列")
         except Exception:
             logger.exception("[Midflight] on_batch_dedup 异常（已自捕获）")
+
+    # ============ 运行状态跟踪 ============
+
+    @staticmethod
+    def _is_control_batch(event) -> bool:
+        """识别跨会话/合并类插件的控制批次（按文本标记，与 session_merger 的
+        判定逻辑同源：cross_session.py 的 ROUTE_MARKER 与官方旧版跨会话投递模板）。"""
+        try:
+            parts = []
+            for m in (getattr(event, "messages", None) or []):
+                s = str(getattr(m, "message_str", "") or "")
+                if not s:
+                    chain = getattr(m, "chain", None) or []
+                    s = "".join(getattr(e, "text", "") for e in chain if isinstance(e, Text))
+                parts.append(s)
+            blob = "\n".join(parts)
+            if not blob:
+                return False
+            if "[merge_cross_session_request]" in blob:
+                return True
+            # 官方旧版跨会话投递 notice（弱上下文，需独立成轮做禁工具处理）
+            if "跨会话消息" in blob and "不需要再次调用跨会话工具" in blob:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _touch_run(self, sid: str, event):
+        """工具边界心跳：记录/刷新该 sid 正在执行的 agent 轮。"""
+        run = self._run_active.get(sid)
+        if run is not None and run.get("event") is not event:
+            # 事件对象变了（旧轮没收到收尾事件）：以最新事件为准重建
+            self._restore_pending_silent(sid)
+            run = None
+        if run is None:
+            self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
+        else:
+            run["ts"] = time.time()
+
+    def _get_active_run(self, sid: str):
+        """取该 sid 的运行中状态；超过活动超时视为已结束（异常路径兜底）。"""
+        run = self._run_active.get(sid)
+        if run is None:
+            return None
+        if time.time() - float(run.get("ts", 0)) > self._active_timeout:
+            self._log_debug(f"{sid} 运行心跳超 {self._active_timeout}s 未更新，判定已结束")
+            self._run_active.pop(sid, None)
+            self._restore_pending_silent(sid)
+            return None
+        return run
+
+    async def _finish_run(self, sid: str):
+        """一轮结束：清标记，并把批次拦截来的待注入消息还原回 buffer 后主动 flush，
+        让它们立刻走正常管线成为新一轮（不卡住、不丢失）。"""
+        self._run_active.pop(sid, None)
+        items = self._pending_inject.pop(sid, None)
+        if not items:
+            return
+        shims = [item[0] for item in items]
+        logger.info(f"[Midflight] {sid} 本轮已结束，{len(shims)} 条拦截消息还原走正常管线")
+        await self._restore_to_buffer(sid, shims, flush=True)
+
+    def _restore_pending_silent(self, sid: str):
+        """同步兜底还原（不 flush）：用于心跳超时等无法 await 的场景，
+        消息回到 buffer，等聊天插件下一次防抖/合并自然带出。"""
+        items = self._pending_inject.pop(sid, None)
+        if not items:
+            return
+        try:
+            buffer = self.ctx.get_buffer(sid)
+            if buffer is not None:
+                shims = [item[0] for item in items]
+                buffer.buffer[:0] = shims
+                logger.info(f"[Midflight] {sid} {len(shims)} 条拦截消息已还原回 buffer")
+        except Exception:
+            logger.exception("[Midflight] 还原拦截消息异常（已自捕获）")
+
+    async def _restore_to_buffer(self, sid: str, shims: list, flush: bool = False):
+        """把消息还原回 SessionBuffer（保持原顺序置于头部），可选立即 flush。"""
+        if not shims:
+            return
+        try:
+            buffer = self.ctx.get_buffer(sid)
+            if buffer is None:
+                return
+            async with buffer.lock:
+                buffer.buffer[:0] = shims
+            if flush:
+                await self.ctx.flush_session_messages(sid)
+        except Exception:
+            logger.exception("[Midflight] 还原消息回 buffer 异常（已自捕获）")
 
     # ============ 过滤器 ============
 
@@ -570,9 +863,70 @@ class MidflightMessagePlugin(BasePlugin):
         except Exception:
             return ""
 
+    def _format_native(self, msg_event, text: str) -> str:
+        """生成与官方一致的消息格式。优先直接调用官方内置 kira-ai 插件的
+        _format_user_message（builtin_plugins/kira-ai/main.py:44-59），
+        自动跟随官方格式演进；取不到实例/方法时退化为内置复刻版；
+        任何异常最终退化为裸文本，绝不报错。"""
+        try:
+            message = getattr(msg_event, "message", None) or msg_event
+            # 官方函数读取 msg.message_str：buffer/拦截路径的消息可能尚未被
+            # handle_im_batch_message 文本化过，先补上（与官方赋值完全一致）
+            try:
+                if not getattr(message, "message_str", None):
+                    message.message_str = text
+            except Exception:
+                pass
+            inst = self.ctx.get_plugin_inst("kira-ai")
+            fn = getattr(inst, "_format_user_message", None) if inst is not None else None
+            if callable(fn):
+                result = fn(message)
+                if isinstance(result, str) and result:
+                    return result
+        except Exception:
+            pass
+        # 兜底：复刻官方格式（官方函数不可用时的静态快照）
+        try:
+            message = getattr(msg_event, "message", None) or msg_event
+            ts = float(getattr(message, "timestamp", 0) or time.time())
+            tz = self.ctx.get_timezone()
+            dt = datetime.fromtimestamp(ts, tz=tz) if tz else datetime.fromtimestamp(ts)
+            date_str = dt.strftime("%b %d %Y %H:%M %a")
+            mid = getattr(message, "message_id", "")
+            sender = getattr(message, "sender", None)
+            nick = getattr(sender, "nickname", "") if sender else ""
+            uid = getattr(sender, "user_id", "") if sender else ""
+            is_notice = bool(getattr(message, "is_notice", False))
+            try:
+                is_group = bool(message.is_group_message())
+            except Exception:
+                try:
+                    is_group = bool(msg_event.is_group_message())
+                except Exception:
+                    is_group = getattr(message, "group", None) is not None
+            if is_group:
+                group = getattr(message, "group", None)
+                gn = getattr(group, "group_name", "") if group else ""
+                gid = getattr(group, "group_id", "") if group else ""
+                if is_notice:
+                    return f"[{date_str}] Notice [group_id: {gid}, user_id: {uid}] | {text}"
+                return (f"[{date_str}] [message_id: {mid}] "
+                        f"[group_name: {gn} group_id: {gid} "
+                        f"user_nickname: {nick}, user_id: {uid}] | {text}")
+            if is_notice:
+                return f"[{date_str}] Notice [user_id: {uid}] | {text}"
+            return f"[{date_str}] [message_id: {mid}] [user_nickname: {nick}, user_id: {uid}] | {text}"
+        except Exception:
+            return text
+
     def _render_template(self, template: str, msg_event, text: str, n: int) -> str:
         message = getattr(msg_event, "message", None)
         nickname = str(getattr(getattr(message, "sender", None), "nickname", "") or "")
+        user_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        group = getattr(message, "group", None)
+        group_name = str(getattr(group, "group_name", "") or "") if group else ""
+        group_id = str(getattr(group, "group_id", "") or "") if group else ""
         ts = getattr(message, "timestamp", 0) or 0
         try:
             time_str = time.strftime("%H:%M:%S", time.localtime(float(ts)))
@@ -580,7 +934,9 @@ class MidflightMessagePlugin(BasePlugin):
             time_str = ""
         try:
             return template.format(
-                sender_nickname=nickname, text=text, time=time_str, n=n)
+                sender_nickname=nickname, text=text, time=time_str, n=n,
+                user_id=user_id, message_id=message_id,
+                group_name=group_name, group_id=group_id)
         except Exception:
             return text
 
