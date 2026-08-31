@@ -152,6 +152,33 @@
       }
     }
   },
+  "section_media": {
+    "type": "section",
+    "name": "媒体流入",
+    "collapsed": true,
+    "fields": {
+      "allow_record": {
+        "type": "switch", "default": true,
+        "name": "允许语音消息流入",
+        "hint": "语音由官方 STT 转写成文字后流入（[Record 转写文本]），与平时聊天完全一致。需已配置默认 STT 模型。"
+      },
+      "allow_image": {
+        "type": "switch", "default": true,
+        "name": "允许图片/表情包流入",
+        "hint": "图片由官方 VLM 生成描述并落盘，流入内容为 [Image 描述, file_path: ...]，bot 后续可用文件工具读取原图。"
+      },
+      "allow_file": {
+        "type": "switch", "default": true,
+        "name": "允许文件/视频流入",
+        "hint": "10MB 以内的文件/视频会落盘并携带 file_path 流入，bot 可直接读取原文件；超过 10MB 仅流入文件名提示。"
+      },
+      "allow_forward": {
+        "type": "switch", "default": true,
+        "name": "允许合并转发流入",
+        "hint": "合并转发内容会被递归展开后流入。"
+      }
+    }
+  },
   "section_overrides": {
     "type": "section",
     "name": "会话级覆盖（高级）",

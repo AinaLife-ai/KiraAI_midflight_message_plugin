@@ -84,6 +84,13 @@ class MidflightMessagePlugin(BasePlugin):
         inject = cfg.get("section_inject", {}) or {}
         self.template = str(inject.get("template", "") or "")
 
+        media = cfg.get("section_media", {}) or {}
+        # 媒体流入开关：语音/图片/文件/合并转发，默认全部允许
+        self.allow_record = bool(media.get("allow_record", True))
+        self.allow_image = bool(media.get("allow_image", True))
+        self.allow_file = bool(media.get("allow_file", True))
+        self.allow_forward = bool(media.get("allow_forward", True))
+
         overrides = cfg.get("section_overrides", {}) or {}
         raw_overrides = overrides.get("overrides", {})
         self.overrides = raw_overrides if isinstance(raw_overrides, dict) else {}
@@ -357,6 +364,13 @@ class MidflightMessagePlugin(BasePlugin):
             except re.error:
                 continue
 
+        # 媒体类型开关：含被禁用类型媒体的消息不流入（放回 buffer 走官方管线）。
+        # 媒体内容本身由官方 message_format_to_text 统一转换（语音→STT 文字、
+        # 图片/表情→VLM 描述+落盘路径、文件/视频≤10MB→落盘路径、转发→递归展开），
+        # 流入后 bot 不仅能看到描述，还能用 file_read 类工具读取原文件。
+        if not self._media_allowed(msg_event, cfg):
+            return False
+
         # 流入方式
         return self._match_flow_method(msg_event, text, cfg)
 
@@ -396,6 +410,24 @@ class MidflightMessagePlugin(BasePlugin):
             return hit_keyword
         # all：@ / 回复 / 唤醒词 / 戳一戳 任一即可
         return hit_at or hit_reply or hit_keyword or hit_poke
+
+    def _media_allowed(self, msg_event, cfg: dict) -> bool:
+        """检查消息链中的媒体元素是否被对应开关允许（防御式，异常视为允许）。"""
+        try:
+            message = getattr(msg_event, "message", None)
+            chain = getattr(message, "chain", None) or []
+            for ele in chain:
+                if isinstance(ele, Record) and not cfg["allow_record"]:
+                    return False
+                if isinstance(ele, (Image, Sticker)) and not cfg["allow_image"]:
+                    return False
+                if isinstance(ele, (File, Video)) and not cfg["allow_file"]:
+                    return False
+                if isinstance(ele, Forward) and not cfg["allow_forward"]:
+                    return False
+            return True
+        except Exception:
+            return True
 
     def _is_poke(self, msg_event) -> bool:
         """戳一戳识别（防御式，识别不了就跳过不报错）。"""
@@ -457,6 +489,10 @@ class MidflightMessagePlugin(BasePlugin):
             "template": self.template,
             "inject_timeout_steps": self.inject_timeout_steps,
             "debug": self.debug,
+            "allow_record": self.allow_record,
+            "allow_image": self.allow_image,
+            "allow_file": self.allow_file,
+            "allow_forward": self.allow_forward,
             "_max_inject": self._eff_max_inject,
             "_freshness": self._eff_freshness,
         }
