@@ -125,8 +125,14 @@ class MidflightMessagePlugin(BasePlugin):
         else:
             self._eff_max_inject = self.max_inject_per_run
 
-        # 新鲜度：0 = 自动读 bot_config.bot.max_message_interval
-        if self.freshness_seconds <= 0:
+        # 新鲜度：-1 = 不限（默认；buffer 里的消息本来都是本轮执行期间到达的，
+        # 配合 S版/Z版 等带合并防抖的聊天插件时，消息常已在队列里等了十几秒，
+        # 限时会导致永远赶不上工具边界）；0 = 自动读 bot_config.bot.max_message_interval；
+        # >0 = 自定义秒数
+        if self.freshness_seconds < 0:
+            self._eff_freshness = -1
+            self._log_debug("freshness_seconds = -1，不限流入时间")
+        elif self.freshness_seconds == 0:
             auto = self._read_core_config("bot_config.bot.max_message_interval")
             self._eff_freshness = self._to_int(auto, FALLBACK_FRESHNESS)
             if self._eff_freshness <= 0:
@@ -529,8 +535,9 @@ class MidflightMessagePlugin(BasePlugin):
                         # 覆盖后重算自动项
                         if self._to_int(cfg["max_inject_per_run"], 0) > 0:
                             cfg["_max_inject"] = self._to_int(cfg["max_inject_per_run"], 0)
-                        if self._to_int(cfg["freshness_seconds"], 0) > 0:
-                            cfg["_freshness"] = self._to_int(cfg["freshness_seconds"], 0)
+                        ov_fresh = self._to_int(cfg["freshness_seconds"], 0)
+                        if ov_fresh != 0:
+                            cfg["_freshness"] = ov_fresh  # -1=不限，>0=自定义秒数
                 except Exception:
                     continue
         cfg["_max_inject"] = max(1, self._to_int(cfg.get("_max_inject"), FALLBACK_MAX_INJECT))

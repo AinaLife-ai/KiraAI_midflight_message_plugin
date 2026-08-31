@@ -121,9 +121,9 @@
       },
       "freshness_seconds": {
         "type": "integer",
-        "default": 0,
+        "default": -1,
         "name": "流入消息新鲜度（秒）",
-        "hint": "0 = 自动读取配置里的最大消息合并间隔（bot_config.bot.max_message_interval）。只流入距当前工具边界 N 秒内到达的消息，防止陈旧消息误注入。"
+        "hint": "-1 = 不限（默认，推荐：缓冲区里的消息本来都是本轮执行期间到达的；配合带合并防抖的聊天插件时，限时反而可能永远赶不上工具边界）；0 = 自动读取系统最大消息合并间隔；>0 = 只流入距当前工具边界 N 秒内到达的消息"
       },
       "max_length": {
         "type": "integer",
