@@ -38,6 +38,9 @@ FALLBACK_MAX_INJECT = 5
 FALLBACK_FRESHNESS = 30
 # “运行中”判定的兜底超时（秒）：自动 = LLM 超时 + 工具超时（与 S版 QueueMerge 同源公式）
 FALLBACK_ACTIVE_TIMEOUT = 180.0
+# 默认流入引导语：让 bot 意识到可以边回边干（KiraAI 每个 LLM 步都会把
+# <msg> 文本响应即时发出，所以中间步回复用户是原生支持的）
+DEFAULT_INJECT_HINT = "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  方式回一两句。）"
 # 唤醒词回退链：按序尝试读取已安装聊天插件的唤醒词配置
 # （plugin_id 候选, 可能的配置键）
 WAKE_KEYWORD_SOURCES = [
@@ -55,7 +58,7 @@ OVERRIDABLE_KEYS = {
     "wake_keywords", "stop_enabled", "stop_words", "stop_match_mode",
     "whitelist_enabled", "whitelist_users", "max_inject_per_run",
     "freshness_seconds", "max_length", "block_patterns", "template",
-    "inject_timeout_steps", "debug",
+    "inject_hint", "inject_hint_text", "inject_timeout_steps", "debug",
 }
 
 
@@ -116,6 +119,8 @@ class MidflightMessagePlugin(BasePlugin):
 
         inject = cfg.get("section_inject", {}) or {}
         self.template = str(inject.get("template", "") or "")
+        self.inject_hint = bool(inject.get("inject_hint", True))
+        self.inject_hint_text = str(inject.get("inject_hint_text", "") or "") or DEFAULT_INJECT_HINT
 
         media = cfg.get("section_media", {}) or {}
         # 媒体流入开关：语音/图片/文件/合并转发，默认全部允许
@@ -300,10 +305,10 @@ class MidflightMessagePlugin(BasePlugin):
 
         for msg_event in pending:
             try:
-                mid = str(getattr(getattr(msg_event, "message", None), "message_id", "") or "")
-                if mid and mid in consumed_map:
+                key = self._dedup_key(getattr(msg_event, "message", None))
+                if key and key in consumed_map:
                     # 已被消费过（注入过），直接丢弃，不放回，防重复
-                    self._log_debug(f"{sid} 消息 {mid} 已消费，丢弃防重")
+                    self._log_debug(f"{sid} 消息 {key} 已消费，丢弃防重")
                     continue
                 text = self._plain_text(msg_event)
                 if cfg["stop_enabled"] and self._match_stop(text, cfg):
@@ -339,9 +344,9 @@ class MidflightMessagePlugin(BasePlugin):
                 async with buffer.lock:
                     buffer.buffer[:0] = leftover
             for m in stop_hit:
-                mid = str(getattr(getattr(m, "message", None), "message_id", "") or "")
-                if mid:
-                    consumed_map[mid] = now
+                key = self._dedup_key(getattr(m, "message", None))
+                if key:
+                    consumed_map[key] = now
             self._wait_steps.pop(sid, None)
             logger.info(f"[Midflight] {sid} 命中停止词，停止本轮后续步骤")
             event.stop()
@@ -377,11 +382,14 @@ class MidflightMessagePlugin(BasePlugin):
         if not inject_block.strip():
             self._wait_steps[sid] = waited + 1
             return
+        # 引导语：让 bot 意识到可以边回边干（只进上下文，不会发出去）
+        if cfg.get("inject_hint") and cfg.get("inject_hint_text"):
+            inject_block = inject_block + "\n" + cfg["inject_hint_text"]
 
         for m, _ in injectable:
-            mid = str(getattr(getattr(m, "message", None), "message_id", "") or "")
-            if mid:
-                consumed_map[mid] = now
+            key = self._dedup_key(getattr(m, "message", None))
+            if key:
+                consumed_map[key] = now
         self._run_inject_count[run_id] = used + len(injectable)
         self._wait_steps.pop(sid, None)
 
@@ -494,10 +502,14 @@ class MidflightMessagePlugin(BasePlugin):
             # 1) 全消费批次去重
             consumed_map = self._consumed.get(sid)
             if consumed_map and messages:
-                ids = [str(getattr(m, "message_id", "") or "") for m in messages]
-                if ids and all(mid and mid in consumed_map for mid in ids):
+                keys = [self._dedup_key(m) for m in messages]
+                if keys and all(k and k in consumed_map for k in keys):
                     logger.info(f"[Midflight] {sid} 批次 {getattr(event, 'event_id', '')} 全部为已消费消息，掐掉重复轮")
                     event.stop()
+                    # QueueMerge 可能已放行该批次并标记 inflight：批次被掐 = run
+                    # 不会发生，它的 inflight 会卡到 stall 兜底（~180s），期间新消息
+                    # 全部排队。顺手释放，避免卡死。
+                    self._release_queue_merge(sid, str(getattr(event, "event_id", "") or ""))
                     return
 
             # 2) 运行中批次拦截
@@ -516,8 +528,8 @@ class MidflightMessagePlugin(BasePlugin):
             for m in messages:
                 shim = _BufferedMsgShim(m, event)
                 try:
-                    mid = str(getattr(m, "message_id", "") or "")
-                    if mid and consumed_map and mid in consumed_map:
+                    key = self._dedup_key(m)
+                    if key and consumed_map and key in consumed_map:
                         continue  # 部分已消费：跳过该条
                     text = self._plain_text(shim)
                     if cfg["stop_enabled"] and self._match_stop(text, cfg):
@@ -543,9 +555,9 @@ class MidflightMessagePlugin(BasePlugin):
                     async with buffer.lock:
                         buffer.buffer[:0] = put_back
                 for s in stop_hit:
-                    mid = str(getattr(getattr(s, "message", None), "message_id", "") or "")
-                    if mid:
-                        consumed_map[mid] = now
+                    key = self._dedup_key(getattr(s, "message", None))
+                    if key:
+                        consumed_map[key] = now
                 run["event"].stop()  # 停的是正在跑的那一轮的事件对象
                 event.stop()
                 logger.info(f"[Midflight] {sid} 批次消息命中停止词，停止当前轮")
@@ -807,6 +819,8 @@ class MidflightMessagePlugin(BasePlugin):
             "max_length": self.max_length,
             "block_patterns": self.block_patterns,
             "template": self.template,
+            "inject_hint": self.inject_hint,
+            "inject_hint_text": self.inject_hint_text,
             "inject_timeout_steps": self.inject_timeout_steps,
             "debug": self.debug,
             "allow_record": self.allow_record,
@@ -854,6 +868,42 @@ class MidflightMessagePlugin(BasePlugin):
             except Exception:
                 continue
         return False
+
+    def _release_queue_merge(self, sid: str, event_id: str):
+        """掐掉批次后 best-effort 释放 S版/Z版 QueueMerge 的 inflight 标记。
+        若 QueueMerge 已放行该批次（inflight=它），批次被掐意味着 run 永远不会
+        发生，QueueMerge 会卡到 stall 兜底（默认约 180s）才自愈，期间新消息全部
+        排队。找不到实例/属性就跳过，绝不报错。"""
+        for pid in ("sustained-chat", "default-chat（z）"):
+            try:
+                inst = self.ctx.get_plugin_inst(pid)
+                sched = getattr(inst, "merge_scheduler", None) if inst is not None else None
+                if sched is None:
+                    continue
+                inflight = getattr(sched, "_inflight", None)
+                if isinstance(inflight, dict) and inflight.get(sid) == event_id:
+                    inflight.pop(sid, None)
+                    since = getattr(sched, "_inflight_since", None)
+                    if isinstance(since, dict):
+                        since.pop(sid, None)
+                    logger.info(f"[Midflight] {sid} 已释放 {pid} QueueMerge 的 inflight 标记")
+            except Exception:
+                continue
+
+    @staticmethod
+    def _dedup_key(message) -> str:
+        """去重键 = message_id + 时间戳复合键。官方 publish_notice 的系统消息
+        message_id 是写死的常量 "system_message"（plugin_context.py:185），
+        单用 id 会把不同时间的后台任务结果误判成同一条已消费消息而整批误杀；
+        同一消息真被重放时时间戳不变，仍能正确去重。"""
+        try:
+            mid = str(getattr(message, "message_id", "") or "")
+            if not mid:
+                return ""
+            ts = int(float(getattr(message, "timestamp", 0) or 0))
+            return f"{mid}@{ts}"
+        except Exception:
+            return ""
 
     def _plain_text(self, msg_event) -> str:
         """提取纯文本（仅 Text 元素），防御式取值。"""

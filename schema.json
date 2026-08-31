@@ -149,6 +149,18 @@
         "default": "",
         "name": "自定义注入模板",
         "hint": "默认留空 = 使用与平时聊天完全一致的官方格式（[时间] [message_id: x] [user_nickname: x, user_id: x] | 内容，群聊另带群名/群号），bot 感知不到差别。仅高级用户自定义，可用变量 {sender_nickname} {user_id} {message_id} {group_name} {group_id} {text} {time} {n}。"
+      },
+      "inject_hint": {
+        "type": "switch",
+        "default": true,
+        "name": "流入引导语",
+        "hint": "开启后，每次流入会在消息末尾附一句给 bot 的引导（只进上下文，不会发出去），提醒它可以一边用 <msg> 回你一两句、一边继续干活。关掉则完全不附加。"
+      },
+      "inject_hint_text": {
+        "type": "textarea",
+        "default": "（以上是任务途中收到的新消息：想回应就继续任务同时用  <msg><text>…</text></msg>  方式回一两句。）",
+        "name": "引导语内容",
+        "hint": "留空 = 用默认引导语。改它可以调整 bot 边回边干的积极性。"
       }
     }
   },
