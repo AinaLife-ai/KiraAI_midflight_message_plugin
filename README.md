@@ -175,6 +175,10 @@ bot 每次工具调用返回 ─────────────────
 <details>
 <summary><b>更新日志</b>（点击展开）</summary>
 
+### v1.2.2
+
+- **修复插件图标不显示**：manifest.json 补齐 `icon` 字段。框架只认 manifest 里显式声明的图标路径（`resolve_manifest_icon_path`），此前只放了 icon.png 文件但未声明，WebUI 无法加载
+
 ### v1.2.1
 
 - **修复媒体功能静默失效**：补齐 `message_elements` 的媒体类导入（Image/Record/File/Sticker/Video/Forward）。v1.1.0/v1.2.0 中该导入遗漏，导致「媒体流入」开关与附件透传被 try/except 吞掉后静默不生效（已对照 KiraAI v2.32.0 全量终审发现并修复）
