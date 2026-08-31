@@ -170,7 +170,7 @@
       "allow_file": {
         "type": "switch", "default": true,
         "name": "允许文件/视频流入",
-        "hint": "10MB 以内的文件/视频会落盘并携带 file_path 流入，bot 可直接读取原文件；超过 10MB 仅流入文件名提示。"
+        "hint": "文件/视频的落盘大小阈值完全跟随官方行为（当前官方硬编码 10MB，超过仅流入文件名提示；官方将来调整则自动跟随）。"
       },
       "allow_forward": {
         "type": "switch", "default": true,
