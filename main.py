@@ -60,6 +60,7 @@ WAKE_KEYWORD_SOURCES = [
 OVERRIDABLE_KEYS = {
     "enabled", "flow_method_group", "flow_method_dm", "accept_poke",
     "wake_keywords", "stop_enabled", "stop_words", "stop_match_mode",
+    "stop_whitelist_enabled", "stop_whitelist_users",
     "whitelist_enabled", "whitelist_users", "max_inject_per_run",
     "freshness_seconds", "max_length", "block_patterns", "template",
     "inject_hint", "inject_hint_text", "inject_timeout_steps", "debug",
@@ -109,6 +110,8 @@ class MidflightMessagePlugin(BasePlugin):
         self.stop_enabled = bool(stop.get("stop_enabled", False))
         self.stop_words = [str(w) for w in (stop.get("stop_words") or []) if str(w)]
         self.stop_match_mode = str(stop.get("stop_match_mode", "contains") or "contains")
+        self.stop_whitelist_enabled = bool(stop.get("stop_whitelist_enabled", False))
+        self.stop_whitelist_users = [str(u) for u in (stop.get("stop_whitelist_users") or []) if str(u).strip()]
 
         scope = cfg.get("section_scope", {}) or {}
         self.session_blacklist = [str(s) for s in (scope.get("session_blacklist") or []) if str(s).strip()]
@@ -316,7 +319,7 @@ class MidflightMessagePlugin(BasePlugin):
                     self._log_debug(f"{sid} 消息 {key} 已消费，丢弃防重")
                     continue
                 text = self._plain_text(msg_event)
-                if cfg["stop_enabled"] and self._match_stop(text, cfg):
+                if cfg["stop_enabled"] and self._stop_allowed(msg_event, cfg) and self._match_stop(text, cfg):
                     stop_hit.append(msg_event)
                     continue
                 if self._pass_filters(msg_event, text, cfg, now):
@@ -537,7 +540,7 @@ class MidflightMessagePlugin(BasePlugin):
                     if key and consumed_map and key in consumed_map:
                         continue  # 部分已消费：跳过该条
                     text = self._plain_text(shim)
-                    if cfg["stop_enabled"] and self._match_stop(text, cfg):
+                    if cfg["stop_enabled"] and self._stop_allowed(shim, cfg) and self._match_stop(text, cfg):
                         stop_hit.append(shim)
                         continue
                     if self._pass_filters(shim, text, cfg, now):
@@ -788,6 +791,14 @@ class MidflightMessagePlugin(BasePlugin):
             pass
         return False
 
+    def _stop_allowed(self, msg_event, cfg: dict) -> bool:
+        """停止词用户白名单（默认关=人人可停；开启后仅名单内 user_id 可触发停止）。"""
+        if not cfg.get("stop_whitelist_enabled"):
+            return True
+        message = getattr(msg_event, "message", None)
+        sender_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
+        return sender_id in cfg.get("stop_whitelist_users", [])
+
     def _match_stop(self, text: str, cfg: dict) -> bool:
         if not text or not cfg["stop_words"]:
             return False
@@ -817,6 +828,8 @@ class MidflightMessagePlugin(BasePlugin):
             "stop_enabled": self.stop_enabled,
             "stop_words": self.stop_words,
             "stop_match_mode": self.stop_match_mode,
+            "stop_whitelist_enabled": self.stop_whitelist_enabled,
+            "stop_whitelist_users": self.stop_whitelist_users,
             "whitelist_enabled": self.whitelist_enabled,
             "whitelist_users": self.whitelist_users,
             "max_inject_per_run": self.max_inject_per_run,
@@ -860,9 +873,12 @@ class MidflightMessagePlugin(BasePlugin):
             cfg["stop_words"] = []
         if not isinstance(cfg.get("whitelist_users"), list):
             cfg["whitelist_users"] = []
+        if not isinstance(cfg.get("stop_whitelist_users"), list):
+            cfg["stop_whitelist_users"] = []
         if not isinstance(cfg.get("block_patterns"), list):
             cfg["block_patterns"] = []
         cfg["whitelist_users"] = [str(u) for u in cfg["whitelist_users"]]
+        cfg["stop_whitelist_users"] = [str(u) for u in cfg["stop_whitelist_users"]]
         return cfg
 
     def _in_blacklist(self, sid: str) -> bool:
