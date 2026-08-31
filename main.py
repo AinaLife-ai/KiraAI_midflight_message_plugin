@@ -18,7 +18,10 @@ import time
 
 from core.plugin import BasePlugin, logger, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
-from core.chat.message_elements import Text, At, Reply, Poke
+from core.chat.message_elements import (
+    Text, At, Reply, Poke,
+    Record, Image, Sticker, File, Video, Forward,
+)
 
 
 # 已消费 message_id 的存活时间（秒）

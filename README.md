@@ -175,6 +175,11 @@ bot 每次工具调用返回 ─────────────────
 <details>
 <summary><b>更新日志</b>（点击展开）</summary>
 
+### v1.2.1
+
+- **修复媒体功能静默失效**：补齐 `message_elements` 的媒体类导入（Image/Record/File/Sticker/Video/Forward）。v1.1.0/v1.2.0 中该导入遗漏，导致「媒体流入」开关与附件透传被 try/except 吞掉后静默不生效（已对照 KiraAI v2.32.0 全量终审发现并修复）
+- 已对 KiraAI **v2.32.0** 重新全量验证：注入/停止/去重路径、框架 API、配置键、`core_version` 兼容性全部通过
+
 ### v1.2.0
 
 - **媒体附件透传**：流入消息中的图片/语音/文件元素挂载到 `ToolResult.attachments`（官方支持），自动落盘并写入可访问路径——修复 native 原生多模态模式（KiraAI v2.31.0+）下流入图片只剩 `[Image attached]`、bot 拿不到原图的问题
