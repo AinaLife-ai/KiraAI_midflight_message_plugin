@@ -245,7 +245,7 @@ async def s5_watchdog(path):
 
 
 async def s6_watchdog_no_false_hard(path):
-    """软放行之后本轮又有活动（说明只是这一步慢）→ 不许清运行中标记。"""
+    """软放行之后本轮又有活动（说明只是这一步慢）→ 升级为硬放行必须被撤销。"""
     p, ctx = await make_plugin(path)
     if not hasattr(p, "inject_grace_seconds"):
         return {"不支持看门狗": True}
@@ -255,16 +255,39 @@ async def s6_watchdog_no_false_hard(path):
     await p._track_run_start(ev)
     b = batch(msg(7101, "插话"))
     await p.on_batch_dedup(b)
-    await asyncio.sleep(3.0)                    # 至少软放行一次
+    await asyncio.sleep(1.6)                    # 等软放行发生
     soft_released = sum(len(v) for v in p._pending_inject.values()) == 0
     still_tracked = p._get_active_run(SID) is not None
-    # 本轮"活过来了"：来一次工具边界（活动 → 清零计数）
-    await p._handle_tool_result(ev, _tool())
-    await asyncio.sleep(3.0)                    # 再等一轮看门狗
+    await p._handle_tool_result(ev, _tool())    # ★ 活动：本轮只是这一步慢，活过来了
+    await asyncio.sleep(2.0)                    # 再等一个升级窗口
     alive = p._get_active_run(SID) is not None   # 不该被硬清
     await p.terminate()
     return {"软放行发生": soft_released, "软放行后仍保留状态": still_tracked,
             "有活动后未被硬清": alive}
+
+
+async def s7_last_step_no_text_is_immediate(path):
+    """「步数用尽、最后一步不发文字」：消息该在工具边界当场注入/还原，不该等看门狗。"""
+    p, ctx = await make_plugin(path)
+    if hasattr(p, "inject_grace_seconds"):
+        p.inject_grace_seconds = 30          # 把看门狗调得很迟钝，验证"根本不靠它"
+        p._ensure_watchdog()
+    ev = batch(msg(1001, "跑个任务"))
+    await p._track_run_start(ev)
+    await p._ensure_stop_checkpoint(ev, _resp(2, [{"id": "t1"}]))   # step2/2 = 最后一步，带工具
+    # 运行中插话：被拦进流入队列
+    b = batch(msg(2001, "插话一句"))
+    await p.on_batch_dedup(b)
+    queued = sum(len(v) for v in p._pending_inject.values())
+    t0 = time.time()
+    await p._handle_tool_result(ev, _tool())     # 末步工具边界 → 应立即收尾
+    dt = time.time() - t0
+    left = sum(len(v) for v in p._pending_inject.values())
+    published = len(ctx.published)                 # 还原后立即 flush → 成新批次
+    await p.terminate()
+    return {"插话被拦": queued == 1, "边界处耗时(秒)": round(dt, 3),
+            "当场收尾(不等看门狗)": dt < 0.5, "已还原并立即放行": published >= 1,
+            "流入队列已空": left == 0}
 
 
 SCENARIOS = [
@@ -274,6 +297,7 @@ SCENARIOS = [
     ("S4 正常跑完（对照：1.2.9 已修）", s4_normal_run_no_text),
     ("S5 看门狗兜底（无收尾信号）", s5_watchdog),
     ("S6 看门狗不误伤：这一步慢（有活动）不硬清状态", s6_watchdog_no_false_hard),
+    ("S7 步数用尽无文字：末步边界当场收尾（不等看门狗）", s7_last_step_no_text_is_immediate),
 ]
 
 
