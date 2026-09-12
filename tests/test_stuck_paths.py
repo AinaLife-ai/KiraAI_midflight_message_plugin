@@ -1,6 +1,6 @@
-"""Midflight：除"最后一步多个 tool_calls"之外，还有哪些情况会留下"幽灵运行中"。
+"""Midflight：除了"最后一步多个 tool_calls"之外，还有哪些情况会留下"幽灵运行中"。
 
-用法: python3 tests/test_stuck_paths.py [plugin_dir ...]   （默认 = 仓库根）
+用法: python3 repro_full/test_stuck_paths.py <midflight/main.py> [<...>]
 
 每个场景之后都做同一件事：**再发一条用户消息**，看它会不会被拦截
 （被拦截 = 用户之后的发言都被吞、又没人处理 ⇒ 只能等心跳超时兜底）。
@@ -199,7 +199,7 @@ async def s3_run_dies_after_llm_request(path):
     await p.on_batch_dedup(b)
     first = b.is_stopped
     if watchdog:
-        await asyncio.sleep(3.5)                 # 等看门狗醒
+        await asyncio.sleep(5.5)                 # 等看门狗（软放行 + 升级硬放行）
     r = {"首次被拦(预期)": first,
          "状态残留": p._get_active_run(SID) is not None,
          "队列残留": sum(len(v) for v in p._pending_inject.values())}
@@ -234,7 +234,7 @@ async def s5_watchdog(path):
     b = batch(msg(7001, "后续发言"))
     await p.on_batch_dedup(b)
     first = b.is_stopped
-    await asyncio.sleep(3.5)                        # 等看门狗
+    await asyncio.sleep(5.5)                        # 等看门狗（软放行 + 硬放行）
     leaked = sum(len(v) for v in p._pending_inject.values())
     run_cleared = p._get_active_run(SID) is None
     let_through = any(stopped is False for _eid, stopped in ctx.published)
@@ -244,12 +244,36 @@ async def s5_watchdog(path):
             "还原批次已放行(不循环)": let_through, **probe}
 
 
+async def s6_watchdog_no_false_hard(path):
+    """软放行之后本轮又有活动（说明只是这一步慢）→ 不许清运行中标记。"""
+    p, ctx = await make_plugin(path)
+    if not hasattr(p, "inject_grace_seconds"):
+        return {"不支持看门狗": True}
+    p.inject_grace_seconds = 1
+    p._ensure_watchdog()
+    ev = batch(msg(1001, "跑个任务"))
+    await p._track_run_start(ev)
+    b = batch(msg(7101, "插话"))
+    await p.on_batch_dedup(b)
+    await asyncio.sleep(3.0)                    # 至少软放行一次
+    soft_released = sum(len(v) for v in p._pending_inject.values()) == 0
+    still_tracked = p._get_active_run(SID) is not None
+    # 本轮"活过来了"：来一次工具边界（活动 → 清零计数）
+    await p._handle_tool_result(ev, _tool())
+    await asyncio.sleep(3.0)                    # 再等一轮看门狗
+    alive = p._get_active_run(SID) is not None   # 不该被硬清
+    await p.terminate()
+    return {"软放行发生": soft_released, "软放行后仍保留状态": still_tracked,
+            "有活动后未被硬清": alive}
+
+
 SCENARIOS = [
     ("S1 停止词（工具边界路径）", s1_stop_word_tool_boundary),
     ("S2 停止词（批次拦截路径）", s2_stop_word_batch_path),
     ("S3 本轮没跑起来（ON_LLM_REQUEST 后被 stop / 异常）", s3_run_dies_after_llm_request),
     ("S4 正常跑完（对照：1.2.9 已修）", s4_normal_run_no_text),
     ("S5 看门狗兜底（无收尾信号）", s5_watchdog),
+    ("S6 看门狗不误伤：这一步慢（有活动）不硬清状态", s6_watchdog_no_false_hard),
 ]
 
 

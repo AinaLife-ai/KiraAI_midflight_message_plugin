@@ -105,7 +105,9 @@ class MidflightMessagePlugin(BasePlugin):
         # 流入队列看门狗：拦截进流入队列后，若这么多秒内一直没搭上工具边界
         # （本轮其实已经结束 / 卡死 / 被别的插件掐掉），就把消息还原走正常管线，
         # 不再死等"运行中判定超时"（默认 180s）。0 = 关闭看门狗。
-        self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 15), 15)
+        # 默认 10s：正常一轮里"拦截 → 下个工具边界"通常只要几秒（本插件日志里
+        # 常见 2~7s/步），10s 覆盖一整个步进，几乎不会误放；模型/工具明显更慢时调大。
+        self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 10), 10)
         self.debug = bool(basic.get("debug", False))
 
         flow = cfg.get("section_flow", {}) or {}
@@ -169,6 +171,12 @@ class MidflightMessagePlugin(BasePlugin):
         self._bypass: dict[str, float] = {}
         # 流入队列看门狗任务
         self._watchdog_task = None
+        # 看门狗两段式放行：
+        #   {sid: 软放行次数}；{sid: 软放行时刻} —— 软放行只放行消息、保留运行中状态，
+        #   再过 grace 秒仍毫无活动（期间任何 LLM 响应/工具边界都会清零，见
+        #   _note_activity）就升级为"硬放行"：清运行中标记 + 释放 QueueMerge
+        self._wd_strikes: dict[str, int] = {}
+        self._wd_escalate: dict[str, float] = {}
         # 上次清理时间
         self._last_gc: float = 0.0
         # 自动解析后的生效值（initialize 中解析）
@@ -265,6 +273,8 @@ class MidflightMessagePlugin(BasePlugin):
             self._finished_run.clear()
             self._pending_inject.clear()
             self._bypass.clear()
+            self._wd_strikes.clear()
+            self._wd_escalate.clear()
             self._last_gc = 0.0
         except Exception:
             pass
@@ -519,6 +529,7 @@ class MidflightMessagePlugin(BasePlugin):
                 await self._finish_run(sid)
                 return
             run["ts"] = time.time()
+            self._note_activity(sid)
             # 末步仍带工具：该步工具执行完 agent 即结束（无最终文本步），
             # 打标记让下一个工具边界不再注入（注入会丢），直接收尾还原
             idx = getattr(resp, "agent_step_index", None)
@@ -709,6 +720,7 @@ class MidflightMessagePlugin(BasePlugin):
             self._run_active[sid] = run
         else:
             run["ts"] = time.time()
+        self._note_activity(sid)
         return run
 
     def _get_active_run(self, sid: str):
@@ -795,12 +807,15 @@ class MidflightMessagePlugin(BasePlugin):
     async def _watchdog_loop(self):
         try:
             while True:
-                await asyncio.sleep(2.0)
                 grace = float(self.inject_grace_seconds or 0)
+                # 每个 grace 至少检查两次（默认 10s → 2s 一次）；grace 调小时自动变密，
+                # 保证"软放行 → 再等一个 grace → 硬放行"的总延迟 ≈ 2×grace
+                await asyncio.sleep(max(0.5, min(2.0, grace / 2)) if grace > 0 else 2.0)
                 if grace <= 0:
                     continue
                 now = time.time()
                 self._gc()
+                # ① 有积压且等够了 → 软放行（只放行消息，保留"运行中"状态）
                 for sid in list(self._pending_inject.keys()):
                     items = self._pending_inject.get(sid) or []
                     if not items:
@@ -811,21 +826,37 @@ class MidflightMessagePlugin(BasePlugin):
                     except Exception:
                         oldest = now
                     if now - oldest >= grace:
-                        await self._release_pending(sid, now - oldest)
+                        self._wd_strikes[sid] = self._wd_strikes.get(sid, 0) + 1
+                        await self._release_pending(sid, now - oldest, hard=False)
+                # ② 软放行后又过了一个 grace 仍毫无活动（期间任何 LLM 响应/工具边界
+                #    都会被 _note_activity 清零）→ 断定本轮已结束/卡死：硬放行
+                for sid in list(self._wd_escalate.keys()):
+                    if sid not in self._wd_strikes:
+                        self._wd_escalate.pop(sid, None)
+                        continue
+                    if now - self._wd_escalate[sid] >= grace:
+                        await self._escalate_dead_run(sid)
         except asyncio.CancelledError:
             return
         except Exception:
             logger.exception("[Midflight] 流入看门狗异常（已自捕获）")
 
-    async def _release_pending(self, sid: str, waited: float):
-        """等太久还没搭上工具边界：把拦截消息还原走正常管线，并清掉可疑的"运行中"。
+    def _note_activity(self, sid: str):
+        """本轮有任何活动（LLM 响应 / 工具边界）→ 撤销看门狗的放行计数与升级计时。"""
+        if self._wd_strikes:
+            self._wd_strikes.pop(sid, None)
+        if self._wd_escalate:
+            self._wd_escalate.pop(sid, None)
+
+    async def _release_pending(self, sid: str, waited: float, hard: bool = False):
+        """等太久还没搭上工具边界：把拦截消息还原走正常管线。
 
         还原的消息会记进 `_bypass`（放行标记）——它们随下次 flush 重新成批次时，
         批次守卫会直接放行，不会又被拦回来（否则就是"还原 → 成批 → 再拦"死循环）。
+
+        `hard=True` 时会一并 `_escalate_dead_run()`（清运行中标记 + 释放 QueueMerge）。
         """
-        items = self._pending_inject.pop(sid, None)
-        if not items:
-            return
+        items = self._pending_inject.pop(sid, None) or []
         shims = [it[0] for it in items]
         now = time.time()
         for it in items:
@@ -835,20 +866,43 @@ class MidflightMessagePlugin(BasePlugin):
                     self._bypass[key] = now
             except Exception:
                 continue
-        # 这一轮显然不会再有工具边界了：连同"运行中"标记一起清掉（并立墓碑，
-        # 防止迟到的工具边界又把它复活成幽灵运行中）
-        run = self._run_active.pop(sid, None)
-        if run is not None:
-            eid = getattr(run.get("event"), "event_id", None)
-            if eid:
-                self._finished_run[sid] = eid
-                self._run_inject_count.pop(eid, None)
+        if shims:
+            if hard:
+                logger.warning(
+                    f"[Midflight] {sid} {len(shims)} 条拦截消息等待 {waited:.0f}s 仍未搭上工具边界"
+                    f"（本轮无收尾信号），已还原走正常管线"
+                )
+            else:
+                logger.warning(
+                    f"[Midflight] {sid} {len(shims)} 条拦截消息等待 {waited:.0f}s 仍未搭上工具边界，"
+                    f"先还原走正常管线（保留本轮状态：若只是这一步慢，后续消息仍可搭车）"
+                )
+                # 记下"软放行时刻"：再过一个 grace 仍毫无活动 → 升级为硬放行
+                self._wd_escalate[sid] = now
+            await self._restore_to_buffer(sid, shims, flush=True)
+        if hard:
+            await self._escalate_dead_run(sid)
+
+    async def _escalate_dead_run(self, sid: str):
+        """软放行后又一个 grace 仍毫无活动 ⇒ 断定本轮不会再有工具边界（真·结束/卡死）。
+
+        清掉"运行中"标记并立墓碑（防止迟到的工具边界把它复活成幽灵运行中）；
+        顺手释放 S/Z 版 QueueMerge 攥着的 in-flight —— 否则它会把后续消息扣在
+        自己的 pending 里、等 stall 兜底（同样 ~180s）。
+        """
+        self._wd_escalate.pop(sid, None)
+        self._wd_strikes.pop(sid, None)
         self._wait_steps.pop(sid, None)
+        run = self._run_active.pop(sid, None)
+        eid = getattr(run.get("event"), "event_id", None) if run else None
+        if eid:
+            self._finished_run[sid] = eid
+            self._run_inject_count.pop(eid, None)
+            self._release_queue_merge(sid, eid)
         logger.warning(
-            f"[Midflight] {sid} {len(shims)} 条拦截消息等待 {waited:.0f}s 仍未搭上工具边界"
-            f"（本轮无收尾信号），已还原走正常管线并清除运行中标记"
+            f"[Midflight] {sid} 软放行后仍无任何活动（LLM 响应 / 工具边界），判定本轮已结束："
+            f"已清除运行中标记" + ("，并释放 QueueMerge 的 in-flight" if eid else "")
         )
-        await self._restore_to_buffer(sid, shims, flush=True)
 
     # ============ 过滤器 ============
 
