@@ -151,6 +151,10 @@ class MidflightMessagePlugin(BasePlugin):
         self._wait_steps: dict[str, int] = {}
         # {sid: {"event": 运行中的批次事件对象, "ts": 最近心跳, "ending": 末步标记}}
         self._run_active: dict[str, dict] = {}
+        # {sid: 已收尾那一轮的 event_id} —— 同一轮里后续的工具边界不得把本轮
+        # 重新标记为“运行中”（一次 LLM 响应带多个 tool_calls 会逐个派发
+        # ON_TOOL_RESULT，第一个边界就已收尾；重建会留下幽灵运行中状态）
+        self._finished_run: dict[str, str] = {}
         # {sid: [(批次消息 shim, 纯文本, 入队时间)]} —— 批次拦截来的待注入消息
         self._pending_inject: dict[str, list] = {}
         # 上次清理时间
@@ -228,6 +232,7 @@ class MidflightMessagePlugin(BasePlugin):
             self._run_inject_count.clear()
             self._wait_steps.clear()
             self._run_active.clear()
+            self._finished_run.clear()
             self._pending_inject.clear()
             self._last_gc = 0.0
         except Exception:
@@ -263,13 +268,17 @@ class MidflightMessagePlugin(BasePlugin):
             self._log_debug(f"{sid} 在会话黑名单中，跳过")
             return
 
-        # 运行心跳：tool_result 触发即证明该 sid 的 agent 轮仍在执行
-        self._touch_run(sid, event)
+        # 运行心跳：tool_result 触发即证明该 sid 的 agent 轮仍在执行。
+        # 返回 None = 本轮已在更早的工具边界收尾（最后一步可能一次派发多个
+        # ON_TOOL_RESULT），此时必须直接退出：既不注入（注入进的是本轮永远
+        # 不会再被模型读到的工具结果），也不能重建“运行中”标记（幽灵状态）
+        run = self._touch_run(sid, event)
+        if run is None:
+            return
 
         # 末步标记（最后一步仍带工具调用）：本边界之后不会再有 LLM 调用，
         # 注入会丢，直接收尾并把待注入消息还原走正常管线
-        run = self._run_active.get(sid)
-        if run and run.get("ending"):
+        if run.get("ending"):
             self._log_debug(f"{sid} 末步工具边界，不再注入，收尾还原")
             await self._finish_run(sid)
             return
@@ -444,8 +453,9 @@ class MidflightMessagePlugin(BasePlugin):
             if sid:
                 # 新轮开始：旧轮若没收到收尾事件（异常路径），其 pending 消息
                 # 与等待计数会残留并被新轮继承——旧轮消息错注入新轮、新轮
-                # 继承旧轮超限计数。先清理再登记。
+                # 继承旧轮超限计数。先清理再登记（含旧的“已收尾”记录）。
                 self._restore_pending_silent(sid)
+                self._finished_run.pop(sid, None)
                 self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
         except Exception:
             pass
@@ -627,7 +637,19 @@ class MidflightMessagePlugin(BasePlugin):
         return False
 
     def _touch_run(self, sid: str, event):
-        """工具边界心跳：记录/刷新该 sid 正在执行的 agent 轮。"""
+        """工具边界心跳：记录/刷新该 sid 正在执行的 agent 轮。
+
+        返回生效的 run 字典；本轮已收尾时返回 None（调用方必须直接退出）。
+        """
+        eid = getattr(event, "event_id", None)
+        if eid and self._finished_run.get(sid) == eid:
+            # 本轮已在更早的工具边界收尾 —— 框架对「一次 LLM 响应里的多个
+            # tool_calls」会逐个派发 ON_TOOL_RESULT，第一个边界已触发
+            # _finish_run；若这里重建 run，就会留下一个“幽灵运行中”状态
+            # （心跳时间停在最后一个工具边界），此后该会话的新消息批次会被
+            # on_batch_dedup 误判为“运行中”而拦截转入流入队列，但本轮根本不
+            # 会再有工具边界来注入 → 消息卡住，直到心跳超时兜底才被还原。
+            return None
         run = self._run_active.get(sid)
         if run is not None and run.get("event") is not event:
             # 事件对象变了（旧轮没收到收尾事件）：以最新事件为准重建
@@ -635,9 +657,11 @@ class MidflightMessagePlugin(BasePlugin):
             self._wait_steps.pop(sid, None)
             run = None
         if run is None:
-            self._run_active[sid] = {"event": event, "ts": time.time(), "ending": False}
+            run = {"event": event, "ts": time.time(), "ending": False}
+            self._run_active[sid] = run
         else:
             run["ts"] = time.time()
+        return run
 
     def _get_active_run(self, sid: str):
         """取该 sid 的运行中状态；超过活动超时视为已结束（异常路径兜底）。"""
@@ -663,6 +687,10 @@ class MidflightMessagePlugin(BasePlugin):
             eid = getattr(run.get("event"), "event_id", None)
             if eid:
                 self._run_inject_count.pop(eid, None)
+                # 记下“本轮已收尾”：同一轮里剩下的工具边界（一次 LLM 响应带多个
+                # tool_calls 时会逐个派发 ON_TOOL_RESULT）不得把本轮重新标记为
+                # 运行中；新的一轮会用新的 event_id，不受影响。
+                self._finished_run[sid] = eid
         items = self._pending_inject.pop(sid, None)
         if not items:
             return
