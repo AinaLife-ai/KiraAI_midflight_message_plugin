@@ -1135,9 +1135,16 @@ class MidflightMessagePlugin(BasePlugin):
                 inflight = getattr(sched, "_inflight", None)
                 if isinstance(inflight, dict) and inflight.get(sid) == event_id:
                     inflight.pop(sid, None)
+                    # v2.5.16/v1.8.7 起 QueueMerge 还会记事件对象与末步标记，一并清掉
+                    ev = getattr(sched, "_inflight_event", None)
+                    if isinstance(ev, dict):
+                        ev.pop(sid, None)
                     since = getattr(sched, "_inflight_since", None)
                     if isinstance(since, dict):
                         since.pop(sid, None)
+                    marked = getattr(sched, "_final_marked", None)
+                    if marked is not None and hasattr(marked, "discard"):
+                        marked.discard(sid)
                     logger.info(f"[Midflight] {sid} 已释放 {pid} QueueMerge 的 inflight 标记")
             except Exception:
                 continue
