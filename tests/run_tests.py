@@ -13,7 +13,7 @@ from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
 
-SUITES = ["test_phantom_run.py", "test_scenarios.py"]
+SUITES = ["test_phantom_run.py", "test_scenarios.py", "test_stuck_paths.py"]
 
 
 def main():
