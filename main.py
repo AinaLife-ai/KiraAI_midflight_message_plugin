@@ -102,12 +102,19 @@ class MidflightMessagePlugin(BasePlugin):
         basic = cfg.get("section_basic", {}) or {}
         self.enabled = bool(basic.get("enabled", True))
         self.inject_timeout_steps = self._to_int(basic.get("inject_timeout_steps", 2), 2)
-        # 流入队列看门狗：拦截进流入队列后，若这么多秒内一直没搭上工具边界
-        # （本轮其实已经结束 / 卡死 / 被别的插件掐掉），就把消息还原走正常管线，
-        # 不再死等"运行中判定超时"（默认 180s）。0 = 关闭看门狗。
-        # 默认 10s：正常一轮里"拦截 → 下个工具边界"通常只要几秒（本插件日志里
-        # 常见 2~7s/步），10s 覆盖一整个步进，几乎不会误放；模型/工具明显更慢时调大。
-        self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 10), 10)
+        # 流入队列看门狗（**默认 0 = 关闭**）：拦截进流入队列后，若这么多秒内一直没搭上
+        # 工具边界，就把消息还原走正常管线，不再死等"运行中判定超时"（默认 180s）。
+        #
+        # 为什么默认关：它是**纯挂钟计时**，不感知 LLM/工具快慢（框架在一次 LLM 调用
+        # 期间不给插件任何信号），所以单步耗时可能几十秒以上的环境（慢推理模型、
+        # 图生成/联网检索这类慢工具）会被它误放——那条消息就不搭车了（不丢，只是改走
+        # 正常队列）。而"最可能卡住"的路径（命中停止词）已经在代码里**当场收尾**，
+        # 不依赖它。剩下会导致卡住的只有"一个工具边界都没有"的罕见路径：
+        #   ① 本轮在 ON_LLM_REQUEST 阶段被别的插件 stop / 中途异常被 EventBus 吞掉；
+        #   ② 最后一步的工具调用全部被 max_tool_calls_per_turn 跳过。
+        # 想让这两条也快速自愈（≈2×grace，而不是 180s）时再打开，取值 ≥ 你环境里
+        # 最慢的一次"LLM 调用 + 工具执行"耗时。
+        self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 0), 0)
         self.debug = bool(basic.get("debug", False))
 
         flow = cfg.get("section_flow", {}) or {}
@@ -243,7 +250,7 @@ class MidflightMessagePlugin(BasePlugin):
             f"poke={self.accept_poke} 停止词={'开' if self.stop_enabled else '关(默认)'} "
             f"上限={self._eff_max_inject} 新鲜度={self._eff_freshness}s "
             f"引导语={'开' if self.inject_hint else '关'} "
-            f"流入等待看门狗={self.inject_grace_seconds}s"
+            f"看门狗={'关' if self.inject_grace_seconds <= 0 else str(self.inject_grace_seconds) + 's'}"
         )
         self._ensure_watchdog()
 

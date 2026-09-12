@@ -290,6 +290,35 @@ async def s7_last_step_no_text_is_immediate(path):
             "流入队列已空": left == 0}
 
 
+async def s8_watchdog_off_timeout_release(path):
+    """看门狗关闭（默认）时，"本轮没跑起来"这类路径靠心跳超时放行 —— 不丢，但要等。
+
+    这里把 _active_timeout 调成 1 秒来模拟心跳过期：新消息到达时应触发
+    "运行中判定超时" → 把积压的拦截消息还原回缓冲 + 放行新批次。
+    """
+    p, ctx = await make_plugin(path)
+    if hasattr(p, "inject_grace_seconds"):
+        p.inject_grace_seconds = 0            # 默认：看门狗关闭
+    p._active_timeout = 1.0                   # 模拟心跳过期（真实默认 = LLM 超时 + 工具超时）
+    ev = batch(msg(1001, "跑个任务"))
+    await p._track_run_start(ev)              # 之后没有任何收尾信号
+    b1 = batch(msg(8001, "第一条"))
+    await p.on_batch_dedup(b1)
+    stuck_in_queue = sum(len(v) for v in p._pending_inject.values())
+    await asyncio.sleep(1.2)                  # 等心跳过期
+    b2 = batch(msg(8002, "第二条"))
+    await p.on_batch_dedup(b2)
+    released = sum(len(v) for v in p._pending_inject.values())
+    restored = ctx.get_buffer(SID).get_length()
+    run_gone = p._get_active_run(SID) is None
+    await p.terminate()
+    return {"（关看门狗）第一条被拦": stuck_in_queue == 1,
+            "心跳过期后队列已清": released == 0,
+            "旧消息已还原回缓冲": restored >= 1,
+            "新批次已放行": not b2.is_stopped,
+            "运行中标记已清": run_gone}
+
+
 SCENARIOS = [
     ("S1 停止词（工具边界路径）", s1_stop_word_tool_boundary),
     ("S2 停止词（批次拦截路径）", s2_stop_word_batch_path),
@@ -298,6 +327,7 @@ SCENARIOS = [
     ("S5 看门狗兜底（无收尾信号）", s5_watchdog),
     ("S6 看门狗不误伤：这一步慢（有活动）不硬清状态", s6_watchdog_no_false_hard),
     ("S7 步数用尽无文字：末步边界当场收尾（不等看门狗）", s7_last_step_no_text_is_immediate),
+    ("S8 关看门狗时：靠心跳超时放行（不丢，但要等）", s8_watchdog_off_timeout_release),
 ]
 
 
