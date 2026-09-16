@@ -547,6 +547,30 @@ class MidflightMessagePlugin(BasePlugin):
         except Exception:
             logger.exception("[Midflight] llm_response 处理异常（已自捕获）")
 
+    @on.final_result()
+    async def _on_final_result(self, event, final_result=None, *_):
+        """ON_FINAL_RESULT（框架 v2.34.4 起真正派发）＝「一轮 agent 执行结束」的权威信号。
+
+        框架在 agent 循环结束、消息已发出、记忆尚未写入时派发一次；**本轮被 stop 也照样
+        派发**（handler 循环之外）。因此它能覆盖 `_ensure_stop_checkpoint` 覆盖不到的缝：
+        在 ON_LLM_RESPONSE / ON_STEP_RESULT 阶段被别的插件 stop 时，框架的 handler 循环
+        会 `break`，本插件的收尾 handler（优先级 0，排在 S/Z 的 50 之后）可能根本没执行，
+        运行中标记就会残留 → 之后该会话的消息全被拦截。
+
+        只在「事件对象就是本插件跟踪的那一轮」时收尾；外来事件（第三方桩事件）不响应。
+        框架在批次于 ON_IM_BATCH_MESSAGE / ON_LLM_REQUEST 阶段就被 return 时**不派发**
+        本钩子——那两种情况本轮根本没跑起来，本来就没有状态需要清。"""
+        try:
+            sid = getattr(event, "sid", None) or getattr(getattr(event, "session", None), "sid", None)
+            if not sid:
+                return
+            run = self._run_active.get(sid)
+            if run is None or run.get("event") is not event:
+                return
+            await self._finish_run(sid)
+        except Exception:
+            logger.exception("[Midflight] final_result 处理异常（已自捕获）")
+
     @on.im_batch_message(priority=Priority.SYS_HIGH)
     async def on_batch_dedup(self, event: KiraMessageBatchEvent, *_):
         """批次守卫（必须先于 S版 QueueMerge 等 HIGH 优先级 handler 执行）：
@@ -703,10 +727,25 @@ class MidflightMessagePlugin(BasePlugin):
         return False
 
     def _touch_run(self, sid: str, event):
-        """工具边界心跳：记录/刷新该 sid 正在执行的 agent 轮。
+        """工具边界心跳：刷新该 sid 正在执行的 agent 轮。
 
-        返回生效的 run 字典；本轮已收尾时返回 None（调用方必须直接退出）。
-        """
+        返回生效的 run 字典；**不是本插件跟踪的那一轮时返回 None**（调用方必须直接退出）。
+
+        ⚠️ 运行中状态**只能由 ON_LLM_REQUEST（_track_run_start）建立**：框架里每一轮
+        agent 都必然先经过 ON_LLM_REQUEST，工具边界只可能是它的后续。所以这里遇到
+        「没有登记过任何轮」或「事件对象不是本轮」时，只可能是：
+          · **外来事件**——第三方插件自造的桩事件（例如子代理插件的
+            `_make_stub_event`：它携带**真实会话 sid**，但 event_id/事件对象都不是
+            框架的批次，且永远不会走 handle_im_batch_message）；
+          · 一轮结束后的**迟到边界**。
+        两种情况都必须**直接忽略**（不注入、不还原、不重建）：
+          · 若按“以最新事件为准重建”处理，桩事件会凭空造出一个“幽灵运行中” →
+            该会话此后所有消息批次被 `on_batch_dedup` 拦截转入流入队列，却再也等不到
+            工具边界去注入；而下一个桩事件边界还会把流入队列里的**用户消息灌进子代理
+            的工具结果**并标记已消费（主 AI 永远看不到，之后 flush 回来还会被去重掐掉）。
+          · 迟到的旧轮边界同理（本轮已结束，重建只会留下幽灵）。
+        心跳过期（_get_active_run 超时）那条路径**不需要**靠工具边界抢救：超时释放时
+        已把流入队列还原回缓冲，新批次会照常放行（见 S8 场景）。"""
         eid = getattr(event, "event_id", None)
         if eid and self._finished_run.get(sid) == eid:
             # 本轮已在更早的工具边界收尾 —— 框架对「一次 LLM 响应里的多个
@@ -717,16 +756,13 @@ class MidflightMessagePlugin(BasePlugin):
             # 会再有工具边界来注入 → 消息卡住，直到心跳超时兜底才被还原。
             return None
         run = self._run_active.get(sid)
-        if run is not None and run.get("event") is not event:
-            # 事件对象变了（旧轮没收到收尾事件）：以最新事件为准重建
-            self._restore_pending_silent(sid)
-            self._wait_steps.pop(sid, None)
-            run = None
-        if run is None:
-            run = {"event": event, "ts": time.time(), "ending": False}
-            self._run_active[sid] = run
-        else:
-            run["ts"] = time.time()
+        if run is None or run.get("event") is not event:
+            self._log_debug(
+                f"{sid} 工具边界来自非本轮事件（event_id={eid}），已忽略"
+                f"（不注入、不还原、不重建运行中状态）"
+            )
+            return None
+        run["ts"] = time.time()
         self._note_activity(sid)
         return run
 
