@@ -59,11 +59,14 @@ WAKE_KEYWORD_SOURCES = [
      ("waking_words", "wake_keywords", "wake_words")),
 ]
 
-# 系统触发事件的 sender user_id：S版私聊主动回复（system_proactive_dm）、
-# 定时任务（system_scheduled）、官方系统消息（system_message）。
-# 它们携带"开新一轮"的提示词与工具黑名单等特殊语义，不是用户闲聊，
-# 既不参与停止词判定也不转入流入队列，原样留在批次里放行
-SYSTEM_SENDER_IDS = {"system_proactive_dm", "system_scheduled", "system_message"}
+# 触发型系统事件的 sender user_id：S版私聊主动回复（system_proactive_dm）、
+# 定时任务（system_scheduled）。它们携带"开新一轮"的提示词与工具黑名单等特殊
+# 语义，不是用户闲聊——但**默认不特殊照顾**（一视同仁走停止词+注入判定），
+# 仅当配置 system_trigger_passthrough 开启时，本集合及 system_ 前缀 sender 的
+# 消息才既不判停止词也不转入流入队列，原样留在批次里放行开新轮。
+# 注意与系统提醒类消息区分：框架 publish_notice 的提醒（is_notice=True 或
+# message_id="system_message"）由 notice_skip_stop 开关单独控制（见 _is_notice）。
+SYSTEM_SENDER_IDS = {"system_proactive_dm", "system_scheduled"}
 
 # 可被 overrides 覆盖的键
 OVERRIDABLE_KEYS = {
@@ -74,6 +77,7 @@ OVERRIDABLE_KEYS = {
     "freshness_seconds", "max_length", "block_patterns", "template",
     "inject_hint", "inject_hint_text", "inject_timeout_steps",
     "inject_grace_seconds", "debug",
+    "system_trigger_passthrough", "notice_skip_stop",
 }
 
 
@@ -121,6 +125,10 @@ class MidflightMessagePlugin(BasePlugin):
         # 想让这两条也快速自愈（≈2×grace，而不是 180s）时再打开，取值 ≥ 你环境里
         # 最慢的一次"LLM 调用 + 工具执行"耗时。
         self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 0), 0)
+        # 触发型系统事件放行（默认关 = 一视同仁）：开启后 sender.user_id ∈
+        # SYSTEM_SENDER_IDS 或以 system_ 开头的消息在运行中拦截时不判停止词、
+        # 不转注入，原样留在批次里放行开新轮（保留其提示词/工具黑名单语义）
+        self.system_trigger_passthrough = bool(basic.get("system_trigger_passthrough", False))
         self.debug = bool(basic.get("debug", False))
 
         flow = cfg.get("section_flow", {}) or {}
@@ -135,6 +143,10 @@ class MidflightMessagePlugin(BasePlugin):
         self.stop_match_mode = str(stop.get("stop_match_mode", "contains") or "contains")
         self.stop_whitelist_enabled = bool(stop.get("stop_whitelist_enabled", False))
         self.stop_whitelist_users = [str(u) for u in (stop.get("stop_whitelist_users") or []) if str(u).strip()]
+        # 系统提醒类消息（is_notice=True 或 message_id="system_message"，即框架
+        # publish_notice 的产物，如 S/Z 的骚扰/休眠提醒）永不参与停止词判定，
+        # 但仍照常走注入过滤可以流入在飞轮。关掉则提醒也一视同仁可触发停止。
+        self.notice_skip_stop = bool(stop.get("notice_skip_stop", True))
 
         scope = cfg.get("section_scope", {}) or {}
         self.session_blacklist = [str(s) for s in (scope.get("session_blacklist") or []) if str(s).strip()]
@@ -390,7 +402,17 @@ class MidflightMessagePlugin(BasePlugin):
                     self._log_debug(f"{sid} 消息 {key} 已消费，丢弃防重")
                     continue
                 text = self._plain_text(msg_event)
-                if cfg["stop_enabled"] and self._stop_allowed(msg_event, cfg) and self._match_stop(text, cfg):
+                message = getattr(msg_event, "message", None)
+                sender_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
+                if cfg["system_trigger_passthrough"] and (
+                        sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_")):
+                    # 触发型系统事件（S版主动回复/定时任务）不消费：放回 buffer
+                    # 走官方管线照常开新轮（提示词/工具黑名单语义完整保留）
+                    rejected.append(msg_event)
+                    continue
+                # 系统提醒（publish_notice 产物）可注入在飞轮，但永不参与停止词判定
+                if (cfg["stop_enabled"] and not (cfg["notice_skip_stop"] and self._is_notice(message))
+                        and self._stop_allowed(msg_event, cfg) and self._match_stop(text, cfg)):
                     stop_hit.append(msg_event)
                     continue
                 if self._pass_filters(msg_event, text, cfg, now):
@@ -663,12 +685,14 @@ class MidflightMessagePlugin(BasePlugin):
             now = time.time()
             stop_hit, injectable, rejected = [], [], []
             for m in messages:
-                # 系统触发事件（S版主动回复/定时任务/官方系统消息）绝对放行：
-                # 既不判停止词也不转注入，原样留在批次里——一条都不消费时
-                # 自然走下方"没有要消费的消息：批次原样放行"路径，
-                # 系统提示词照常开新轮（新轮请求与工具黑名单语义完整保留）
+                # ① 触发型系统事件放行（system_trigger_passthrough，默认关=一视同仁）：
+                # 开启后 S版主动回复/定时任务等 system_* sender 的消息既不判停止词也
+                # 不转注入，原样留在批次里——一条都不消费时自然走下方"没有要消费的
+                # 消息：批次原样放行"路径，系统提示词照常开新轮（新轮请求与工具
+                # 黑名单语义完整保留）
                 sender_id = str(getattr(getattr(m, "sender", None), "user_id", "") or "")
-                if sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_"):
+                if cfg["system_trigger_passthrough"] and (
+                        sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_")):
                     continue
                 shim = _BufferedMsgShim(m, event)
                 try:
@@ -676,7 +700,10 @@ class MidflightMessagePlugin(BasePlugin):
                     if key and consumed_map and key in consumed_map:
                         continue  # 部分已消费：跳过该条
                     text = self._plain_text(shim)
-                    if cfg["stop_enabled"] and self._stop_allowed(shim, cfg) and self._match_stop(text, cfg):
+                    # ② 系统提醒（publish_notice 产物）可注入在飞轮，但永不参与
+                    # 停止词判定（notice_skip_stop，默认开；关掉则一视同仁可停轮）
+                    if (cfg["stop_enabled"] and not (cfg["notice_skip_stop"] and self._is_notice(m))
+                            and self._stop_allowed(shim, cfg) and self._match_stop(text, cfg)):
                         stop_hit.append(shim)
                         continue
                     if self._pass_filters(shim, text, cfg, now):
@@ -1135,6 +1162,8 @@ class MidflightMessagePlugin(BasePlugin):
             "inject_hint_text": self.inject_hint_text,
             "inject_timeout_steps": self.inject_timeout_steps,
             "inject_grace_seconds": self.inject_grace_seconds,
+            "system_trigger_passthrough": self.system_trigger_passthrough,
+            "notice_skip_stop": self.notice_skip_stop,
             "debug": self.debug,
             "allow_record": self.allow_record,
             "allow_image": self.allow_image,
@@ -1212,6 +1241,18 @@ class MidflightMessagePlugin(BasePlugin):
                     logger.info(f"[Midflight] {sid} 已释放 {pid} QueueMerge 的 inflight 标记")
             except Exception:
                 continue
+
+    @staticmethod
+    def _is_notice(message) -> bool:
+        """识别系统提醒类消息（框架 publish_notice 的产物，plugin_context.py:203-244：
+        is_notice=True 且 message_id 恒为 "system_message"；群聊 sender.user_id 为
+        "unknown"、私聊为 sid）。如 S/Z 的骚扰/休眠提醒。防御式取值，异常视为非提醒。"""
+        try:
+            if getattr(message, "is_notice", False):
+                return True
+            return str(getattr(message, "message_id", "") or "") == "system_message"
+        except Exception:
+            return False
 
     @staticmethod
     def _dedup_key(message) -> str:
