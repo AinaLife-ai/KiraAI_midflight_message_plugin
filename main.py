@@ -59,6 +59,16 @@ WAKE_KEYWORD_SOURCES = [
      ("waking_words", "wake_keywords", "wake_words")),
 ]
 
+# 触发型系统事件的 sender user_id：S版私聊主动回复（system_proactive_dm）、
+# 定时任务（system_scheduled）。它们携带"开新一轮"的提示词与工具黑名单等特殊
+# 语义，不是用户闲聊——默认照常走注入判定（可拦进在飞轮），但**默认不触发停止词**
+# （notice_skip_stop 默认开即覆盖：见 _skip_stop_for）；仅当配置
+# system_trigger_passthrough 开启时，本集合及 system_ 前缀 sender 的消息才
+# 既不判停止词也不转入流入队列，原样留在批次里放行开新轮。
+# 注意与系统提醒类消息区分：框架 publish_notice 的提醒（is_notice=True 或
+# message_id="system_message"）同样由 notice_skip_stop 控制（见 _is_notice）。
+SYSTEM_SENDER_IDS = {"system_proactive_dm", "system_scheduled"}
+
 # 可被 overrides 覆盖的键
 OVERRIDABLE_KEYS = {
     "enabled", "flow_method_group", "flow_method_dm", "accept_poke",
@@ -68,6 +78,7 @@ OVERRIDABLE_KEYS = {
     "freshness_seconds", "max_length", "block_patterns", "template",
     "inject_hint", "inject_hint_text", "inject_timeout_steps",
     "inject_grace_seconds", "debug",
+    "system_trigger_passthrough", "notice_skip_stop",
 }
 
 
@@ -115,6 +126,11 @@ class MidflightMessagePlugin(BasePlugin):
         # 想让这两条也快速自愈（≈2×grace，而不是 180s）时再打开，取值 ≥ 你环境里
         # 最慢的一次"LLM 调用 + 工具执行"耗时。
         self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 0), 0)
+        # 触发型系统事件放行（默认关 = 照常注入判定，但 notice_skip_stop 默认开
+        # 时仍不触发停止词）：开启后 sender.user_id ∈ SYSTEM_SENDER_IDS 或以
+        # system_ 开头的消息在运行中拦截时不判停止词、
+        # 不转注入，原样留在批次里放行开新轮（保留其提示词/工具黑名单语义）
+        self.system_trigger_passthrough = bool(basic.get("system_trigger_passthrough", False))
         self.debug = bool(basic.get("debug", False))
 
         flow = cfg.get("section_flow", {}) or {}
@@ -129,6 +145,12 @@ class MidflightMessagePlugin(BasePlugin):
         self.stop_match_mode = str(stop.get("stop_match_mode", "contains") or "contains")
         self.stop_whitelist_enabled = bool(stop.get("stop_whitelist_enabled", False))
         self.stop_whitelist_users = [str(u) for u in (stop.get("stop_whitelist_users") or []) if str(u).strip()]
+        # 系统来源的消息（is_notice=True 或 message_id="system_message" 的框架
+        # publish_notice 提醒，如 S/Z 的骚扰/休眠提醒；以及 sender.user_id 为
+        # system_proactive_dm / system_scheduled / system_ 前缀的触发型系统事件）
+        # 永不参与停止词判定，但仍照常走注入过滤可以流入在飞轮。关掉则一视同仁
+        # 可触发停止。
+        self.notice_skip_stop = bool(stop.get("notice_skip_stop", True))
 
         scope = cfg.get("section_scope", {}) or {}
         self.session_blacklist = [str(s) for s in (scope.get("session_blacklist") or []) if str(s).strip()]
@@ -261,7 +283,9 @@ class MidflightMessagePlugin(BasePlugin):
         try:
             if self._watchdog_task is None or self._watchdog_task.done():
                 self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-        except Exception:
+        except Exception as e:
+            # 不阻止插件加载，但必须可见——否则用户配置了看门狗却实际没有
+            logger.warning(f"[Midflight] 流入看门狗启动失败（不影响插件其余功能）: {e}")
             self._watchdog_task = None
 
     async def terminate(self):
@@ -382,7 +406,16 @@ class MidflightMessagePlugin(BasePlugin):
                     self._log_debug(f"{sid} 消息 {key} 已消费，丢弃防重")
                     continue
                 text = self._plain_text(msg_event)
-                if cfg["stop_enabled"] and self._stop_allowed(msg_event, cfg) and self._match_stop(text, cfg):
+                message = getattr(msg_event, "message", None)
+                if cfg["system_trigger_passthrough"] and self._is_system_sender(message):
+                    # 触发型系统事件（S版主动回复/定时任务）不消费：放回 buffer
+                    # 走官方管线照常开新轮（提示词/工具黑名单语义完整保留）
+                    rejected.append(msg_event)
+                    continue
+                # 系统来源消息（publish_notice 提醒与 system_* 触发型事件）可注入
+                # 在飞轮，但永不参与停止词判定（notice_skip_stop，默认开）
+                if (cfg["stop_enabled"] and not self._skip_stop_for(message, cfg)
+                        and self._stop_allowed(msg_event, cfg) and self._match_stop(text, cfg)):
                     stop_hit.append(msg_event)
                     continue
                 if self._pass_filters(msg_event, text, cfg, now):
@@ -396,7 +429,7 @@ class MidflightMessagePlugin(BasePlugin):
 
         # 单轮流入条数上限：超额部分放回 buffer 留给聊天插件开新轮
         run_id = getattr(event, "event_id", None) or sid
-        used = self._run_inject_count.get(run_id, 0)
+        used = self._run_inject_count.get(run_id, (0, now))[0]
         quota = max(0, cfg["_max_inject"] - used)
         overflow = injectable[quota:]
         injectable = injectable[:quota]
@@ -439,8 +472,14 @@ class MidflightMessagePlugin(BasePlugin):
         for msg_event, text in injectable:
             n += 1
             try:
-                chain = getattr(getattr(msg_event, "message", None), "chain", None)
-                native = await self.ctx.message_processor.message_format_to_text(chain) if chain else text
+                message = getattr(msg_event, "message", None)
+                # 优先复用框架渲染时已写入的 message_str（框架在派发钩子前已完成
+                # 文本化，媒体 caption 也已被聊天插件占位，不会触发 VLM）；
+                # 为空（buffer 路径未经渲染）再回退 message_format_to_text
+                native = str(getattr(message, "message_str", "") or "")
+                if not native:
+                    chain = getattr(message, "chain", None)
+                    native = await self.ctx.message_processor.message_format_to_text(chain) if chain else text
             except Exception:
                 native = text
             native = native or text
@@ -649,13 +688,24 @@ class MidflightMessagePlugin(BasePlugin):
             now = time.time()
             stop_hit, injectable, rejected = [], [], []
             for m in messages:
+                # ① 触发型系统事件放行（system_trigger_passthrough，默认关=照常注入判定）：
+                # 开启后 S版主动回复/定时任务等 system_* sender 的消息既不判停止词也
+                # 不转注入，原样留在批次里——一条都不消费时自然走下方"没有要消费的
+                # 消息：批次原样放行"路径，系统提示词照常开新轮（新轮请求与工具
+                # 黑名单语义完整保留）
+                if cfg["system_trigger_passthrough"] and self._is_system_sender(m):
+                    continue
                 shim = _BufferedMsgShim(m, event)
                 try:
                     key = self._dedup_key(m)
                     if key and consumed_map and key in consumed_map:
                         continue  # 部分已消费：跳过该条
                     text = self._plain_text(shim)
-                    if cfg["stop_enabled"] and self._stop_allowed(shim, cfg) and self._match_stop(text, cfg):
+                    # ② 系统来源消息（publish_notice 提醒与 system_* 触发型事件）可注入
+                    # 在飞轮，但永不参与停止词判定（notice_skip_stop，默认开；关掉则
+                    # 一视同仁可停轮）
+                    if (cfg["stop_enabled"] and not self._skip_stop_for(m, cfg)
+                            and self._stop_allowed(shim, cfg) and self._match_stop(text, cfg)):
                         stop_hit.append(shim)
                         continue
                     if self._pass_filters(shim, text, cfg, now):
@@ -784,8 +834,8 @@ class MidflightMessagePlugin(BasePlugin):
         让它们立刻走正常管线成为新一轮（不卡住、不丢失）。"""
         run = self._run_active.pop(sid, None)
         self._wait_steps.pop(sid, None)
-        # 本轮注入计数一并清理：残留会随轮数无限增长，且 _gc 在超过 200 条时
-        # 整表清空会误伤仍在执行中的轮（其计数被清零 → 超额注入）
+        # 本轮注入计数一并清理：残留会随轮数无限增长
+        # （_gc 只按时间戳淘汰过期项，不负责在途轮次）
         if run is not None:
             eid = getattr(run.get("event"), "event_id", None)
             if eid:
@@ -1114,6 +1164,8 @@ class MidflightMessagePlugin(BasePlugin):
             "inject_hint_text": self.inject_hint_text,
             "inject_timeout_steps": self.inject_timeout_steps,
             "inject_grace_seconds": self.inject_grace_seconds,
+            "system_trigger_passthrough": self.system_trigger_passthrough,
+            "notice_skip_stop": self.notice_skip_stop,
             "debug": self.debug,
             "allow_record": self.allow_record,
             "allow_image": self.allow_image,
@@ -1191,6 +1243,38 @@ class MidflightMessagePlugin(BasePlugin):
                     logger.info(f"[Midflight] {sid} 已释放 {pid} QueueMerge 的 inflight 标记")
             except Exception:
                 continue
+
+    @staticmethod
+    def _is_notice(message) -> bool:
+        """识别系统提醒类消息（框架 publish_notice 的产物，plugin_context.py:203-244：
+        is_notice=True 且 message_id 恒为 "system_message"；群聊 sender.user_id 为
+        "unknown"、私聊为 sid）。如 S/Z 的骚扰/休眠提醒。防御式取值，异常视为非提醒。"""
+        try:
+            if getattr(message, "is_notice", False):
+                return True
+            return str(getattr(message, "message_id", "") or "") == "system_message"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_system_sender(message) -> bool:
+        """识别触发型系统事件的 sender（S版私聊主动回复 system_proactive_dm、
+        定时任务 system_scheduled，及其他 system_ 前缀的合成事件 sender）。
+        防御式取值，异常视为非系统 sender。"""
+        try:
+            sender_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
+            return sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_")
+        except Exception:
+            return False
+
+    def _skip_stop_for(self, message, cfg: dict) -> bool:
+        """notice_skip_stop 开启时，系统来源的消息——publish_notice 提醒
+        （_is_notice）与触发型系统事件（_is_system_sender）——都不参与停止词
+        判定（即所有 system 来源消息默认不能触发停止），但仍照常走注入过滤。
+        供批次拦截与工具边界 drain 两处停止词判定复用，避免逻辑漂移。"""
+        if not cfg["notice_skip_stop"]:
+            return False
+        return self._is_notice(message) or self._is_system_sender(message)
 
     @staticmethod
     def _dedup_key(message) -> str:
@@ -1391,9 +1475,16 @@ class MidflightMessagePlugin(BasePlugin):
                 self._consumed[sid] = m
             else:
                 self._consumed.pop(sid, None)
-        # 流入计数随去重窗口一起过期没有意义，直接限长
-        if len(self._run_inject_count) > 200:
-            self._run_inject_count.clear()
+        # 单轮注入计数：按最后更新时间淘汰（一轮正常远短于去重窗口）。
+        # 绝不整表清空——那会把仍在执行中的轮次计数清零，导致
+        # max_inject_per_run 失效、单轮超量注入；容量上限只淘汰最旧项兜底
+        if self._run_inject_count:
+            for k in [k for k, (_, ts) in self._run_inject_count.items() if ts <= cutoff]:
+                self._run_inject_count.pop(k, None)
+            while len(self._run_inject_count) > 200:
+                oldest = min(self._run_inject_count,
+                             key=lambda k: self._run_inject_count[k][1])
+                self._run_inject_count.pop(oldest, None)
         if len(self._wait_steps) > 200:
             self._wait_steps.clear()
         # 看门狗放行标记：与去重表同 TTL（消息已还原/已处理，标记过期后自然失效）
