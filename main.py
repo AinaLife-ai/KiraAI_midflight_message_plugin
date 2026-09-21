@@ -59,6 +59,12 @@ WAKE_KEYWORD_SOURCES = [
      ("waking_words", "wake_keywords", "wake_words")),
 ]
 
+# 系统触发事件的 sender user_id：S版私聊主动回复（system_proactive_dm）、
+# 定时任务（system_scheduled）、官方系统消息（system_message）。
+# 它们携带"开新一轮"的提示词与工具黑名单等特殊语义，不是用户闲聊，
+# 既不参与停止词判定也不转入流入队列，原样留在批次里放行
+SYSTEM_SENDER_IDS = {"system_proactive_dm", "system_scheduled", "system_message"}
+
 # 可被 overrides 覆盖的键
 OVERRIDABLE_KEYS = {
     "enabled", "flow_method_group", "flow_method_dm", "accept_poke",
@@ -261,7 +267,9 @@ class MidflightMessagePlugin(BasePlugin):
         try:
             if self._watchdog_task is None or self._watchdog_task.done():
                 self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-        except Exception:
+        except Exception as e:
+            # 不阻止插件加载，但必须可见——否则用户配置了看门狗却实际没有
+            logger.warning(f"[Midflight] 流入看门狗启动失败（不影响插件其余功能）: {e}")
             self._watchdog_task = None
 
     async def terminate(self):
@@ -396,7 +404,7 @@ class MidflightMessagePlugin(BasePlugin):
 
         # 单轮流入条数上限：超额部分放回 buffer 留给聊天插件开新轮
         run_id = getattr(event, "event_id", None) or sid
-        used = self._run_inject_count.get(run_id, 0)
+        used = self._run_inject_count.get(run_id, (0, now))[0]
         quota = max(0, cfg["_max_inject"] - used)
         overflow = injectable[quota:]
         injectable = injectable[:quota]
@@ -439,8 +447,14 @@ class MidflightMessagePlugin(BasePlugin):
         for msg_event, text in injectable:
             n += 1
             try:
-                chain = getattr(getattr(msg_event, "message", None), "chain", None)
-                native = await self.ctx.message_processor.message_format_to_text(chain) if chain else text
+                message = getattr(msg_event, "message", None)
+                # 优先复用框架渲染时已写入的 message_str（框架在派发钩子前已完成
+                # 文本化，媒体 caption 也已被聊天插件占位，不会触发 VLM）；
+                # 为空（buffer 路径未经渲染）再回退 message_format_to_text
+                native = str(getattr(message, "message_str", "") or "")
+                if not native:
+                    chain = getattr(message, "chain", None)
+                    native = await self.ctx.message_processor.message_format_to_text(chain) if chain else text
             except Exception:
                 native = text
             native = native or text
@@ -649,6 +663,13 @@ class MidflightMessagePlugin(BasePlugin):
             now = time.time()
             stop_hit, injectable, rejected = [], [], []
             for m in messages:
+                # 系统触发事件（S版主动回复/定时任务/官方系统消息）绝对放行：
+                # 既不判停止词也不转注入，原样留在批次里——一条都不消费时
+                # 自然走下方"没有要消费的消息：批次原样放行"路径，
+                # 系统提示词照常开新轮（新轮请求与工具黑名单语义完整保留）
+                sender_id = str(getattr(getattr(m, "sender", None), "user_id", "") or "")
+                if sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_"):
+                    continue
                 shim = _BufferedMsgShim(m, event)
                 try:
                     key = self._dedup_key(m)
@@ -784,8 +805,8 @@ class MidflightMessagePlugin(BasePlugin):
         让它们立刻走正常管线成为新一轮（不卡住、不丢失）。"""
         run = self._run_active.pop(sid, None)
         self._wait_steps.pop(sid, None)
-        # 本轮注入计数一并清理：残留会随轮数无限增长，且 _gc 在超过 200 条时
-        # 整表清空会误伤仍在执行中的轮（其计数被清零 → 超额注入）
+        # 本轮注入计数一并清理：残留会随轮数无限增长
+        # （_gc 只按时间戳淘汰过期项，不负责在途轮次）
         if run is not None:
             eid = getattr(run.get("event"), "event_id", None)
             if eid:
@@ -1391,9 +1412,16 @@ class MidflightMessagePlugin(BasePlugin):
                 self._consumed[sid] = m
             else:
                 self._consumed.pop(sid, None)
-        # 流入计数随去重窗口一起过期没有意义，直接限长
-        if len(self._run_inject_count) > 200:
-            self._run_inject_count.clear()
+        # 单轮注入计数：按最后更新时间淘汰（一轮正常远短于去重窗口）。
+        # 绝不整表清空——那会把仍在执行中的轮次计数清零，导致
+        # max_inject_per_run 失效、单轮超量注入；容量上限只淘汰最旧项兜底
+        if self._run_inject_count:
+            for k in [k for k, (_, ts) in self._run_inject_count.items() if ts <= cutoff]:
+                self._run_inject_count.pop(k, None)
+            while len(self._run_inject_count) > 200:
+                oldest = min(self._run_inject_count,
+                             key=lambda k: self._run_inject_count[k][1])
+                self._run_inject_count.pop(oldest, None)
         if len(self._wait_steps) > 200:
             self._wait_steps.clear()
         # 看门狗放行标记：与去重表同 TTL（消息已还原/已处理，标记过期后自然失效）
