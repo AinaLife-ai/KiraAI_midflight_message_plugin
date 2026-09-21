@@ -61,11 +61,12 @@ WAKE_KEYWORD_SOURCES = [
 
 # 触发型系统事件的 sender user_id：S版私聊主动回复（system_proactive_dm）、
 # 定时任务（system_scheduled）。它们携带"开新一轮"的提示词与工具黑名单等特殊
-# 语义，不是用户闲聊——但**默认不特殊照顾**（一视同仁走停止词+注入判定），
-# 仅当配置 system_trigger_passthrough 开启时，本集合及 system_ 前缀 sender 的
-# 消息才既不判停止词也不转入流入队列，原样留在批次里放行开新轮。
+# 语义，不是用户闲聊——默认照常走注入判定（可拦进在飞轮），但**默认不触发停止词**
+# （notice_skip_stop 默认开即覆盖：见 _skip_stop_for）；仅当配置
+# system_trigger_passthrough 开启时，本集合及 system_ 前缀 sender 的消息才
+# 既不判停止词也不转入流入队列，原样留在批次里放行开新轮。
 # 注意与系统提醒类消息区分：框架 publish_notice 的提醒（is_notice=True 或
-# message_id="system_message"）由 notice_skip_stop 开关单独控制（见 _is_notice）。
+# message_id="system_message"）同样由 notice_skip_stop 控制（见 _is_notice）。
 SYSTEM_SENDER_IDS = {"system_proactive_dm", "system_scheduled"}
 
 # 可被 overrides 覆盖的键
@@ -125,8 +126,9 @@ class MidflightMessagePlugin(BasePlugin):
         # 想让这两条也快速自愈（≈2×grace，而不是 180s）时再打开，取值 ≥ 你环境里
         # 最慢的一次"LLM 调用 + 工具执行"耗时。
         self.inject_grace_seconds = self._to_int(basic.get("inject_grace_seconds", 0), 0)
-        # 触发型系统事件放行（默认关 = 一视同仁）：开启后 sender.user_id ∈
-        # SYSTEM_SENDER_IDS 或以 system_ 开头的消息在运行中拦截时不判停止词、
+        # 触发型系统事件放行（默认关 = 照常注入判定，但 notice_skip_stop 默认开
+        # 时仍不触发停止词）：开启后 sender.user_id ∈ SYSTEM_SENDER_IDS 或以
+        # system_ 开头的消息在运行中拦截时不判停止词、
         # 不转注入，原样留在批次里放行开新轮（保留其提示词/工具黑名单语义）
         self.system_trigger_passthrough = bool(basic.get("system_trigger_passthrough", False))
         self.debug = bool(basic.get("debug", False))
@@ -143,9 +145,11 @@ class MidflightMessagePlugin(BasePlugin):
         self.stop_match_mode = str(stop.get("stop_match_mode", "contains") or "contains")
         self.stop_whitelist_enabled = bool(stop.get("stop_whitelist_enabled", False))
         self.stop_whitelist_users = [str(u) for u in (stop.get("stop_whitelist_users") or []) if str(u).strip()]
-        # 系统提醒类消息（is_notice=True 或 message_id="system_message"，即框架
-        # publish_notice 的产物，如 S/Z 的骚扰/休眠提醒）永不参与停止词判定，
-        # 但仍照常走注入过滤可以流入在飞轮。关掉则提醒也一视同仁可触发停止。
+        # 系统来源的消息（is_notice=True 或 message_id="system_message" 的框架
+        # publish_notice 提醒，如 S/Z 的骚扰/休眠提醒；以及 sender.user_id 为
+        # system_proactive_dm / system_scheduled / system_ 前缀的触发型系统事件）
+        # 永不参与停止词判定，但仍照常走注入过滤可以流入在飞轮。关掉则一视同仁
+        # 可触发停止。
         self.notice_skip_stop = bool(stop.get("notice_skip_stop", True))
 
         scope = cfg.get("section_scope", {}) or {}
@@ -403,15 +407,14 @@ class MidflightMessagePlugin(BasePlugin):
                     continue
                 text = self._plain_text(msg_event)
                 message = getattr(msg_event, "message", None)
-                sender_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
-                if cfg["system_trigger_passthrough"] and (
-                        sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_")):
+                if cfg["system_trigger_passthrough"] and self._is_system_sender(message):
                     # 触发型系统事件（S版主动回复/定时任务）不消费：放回 buffer
                     # 走官方管线照常开新轮（提示词/工具黑名单语义完整保留）
                     rejected.append(msg_event)
                     continue
-                # 系统提醒（publish_notice 产物）可注入在飞轮，但永不参与停止词判定
-                if (cfg["stop_enabled"] and not (cfg["notice_skip_stop"] and self._is_notice(message))
+                # 系统来源消息（publish_notice 提醒与 system_* 触发型事件）可注入
+                # 在飞轮，但永不参与停止词判定（notice_skip_stop，默认开）
+                if (cfg["stop_enabled"] and not self._skip_stop_for(message, cfg)
                         and self._stop_allowed(msg_event, cfg) and self._match_stop(text, cfg)):
                     stop_hit.append(msg_event)
                     continue
@@ -685,14 +688,12 @@ class MidflightMessagePlugin(BasePlugin):
             now = time.time()
             stop_hit, injectable, rejected = [], [], []
             for m in messages:
-                # ① 触发型系统事件放行（system_trigger_passthrough，默认关=一视同仁）：
+                # ① 触发型系统事件放行（system_trigger_passthrough，默认关=照常注入判定）：
                 # 开启后 S版主动回复/定时任务等 system_* sender 的消息既不判停止词也
                 # 不转注入，原样留在批次里——一条都不消费时自然走下方"没有要消费的
                 # 消息：批次原样放行"路径，系统提示词照常开新轮（新轮请求与工具
                 # 黑名单语义完整保留）
-                sender_id = str(getattr(getattr(m, "sender", None), "user_id", "") or "")
-                if cfg["system_trigger_passthrough"] and (
-                        sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_")):
+                if cfg["system_trigger_passthrough"] and self._is_system_sender(m):
                     continue
                 shim = _BufferedMsgShim(m, event)
                 try:
@@ -700,9 +701,10 @@ class MidflightMessagePlugin(BasePlugin):
                     if key and consumed_map and key in consumed_map:
                         continue  # 部分已消费：跳过该条
                     text = self._plain_text(shim)
-                    # ② 系统提醒（publish_notice 产物）可注入在飞轮，但永不参与
-                    # 停止词判定（notice_skip_stop，默认开；关掉则一视同仁可停轮）
-                    if (cfg["stop_enabled"] and not (cfg["notice_skip_stop"] and self._is_notice(m))
+                    # ② 系统来源消息（publish_notice 提醒与 system_* 触发型事件）可注入
+                    # 在飞轮，但永不参与停止词判定（notice_skip_stop，默认开；关掉则
+                    # 一视同仁可停轮）
+                    if (cfg["stop_enabled"] and not self._skip_stop_for(m, cfg)
                             and self._stop_allowed(shim, cfg) and self._match_stop(text, cfg)):
                         stop_hit.append(shim)
                         continue
@@ -1253,6 +1255,26 @@ class MidflightMessagePlugin(BasePlugin):
             return str(getattr(message, "message_id", "") or "") == "system_message"
         except Exception:
             return False
+
+    @staticmethod
+    def _is_system_sender(message) -> bool:
+        """识别触发型系统事件的 sender（S版私聊主动回复 system_proactive_dm、
+        定时任务 system_scheduled，及其他 system_ 前缀的合成事件 sender）。
+        防御式取值，异常视为非系统 sender。"""
+        try:
+            sender_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
+            return sender_id in SYSTEM_SENDER_IDS or sender_id.startswith("system_")
+        except Exception:
+            return False
+
+    def _skip_stop_for(self, message, cfg: dict) -> bool:
+        """notice_skip_stop 开启时，系统来源的消息——publish_notice 提醒
+        （_is_notice）与触发型系统事件（_is_system_sender）——都不参与停止词
+        判定（即所有 system 来源消息默认不能触发停止），但仍照常走注入过滤。
+        供批次拦截与工具边界 drain 两处停止词判定复用，避免逻辑漂移。"""
+        if not cfg["notice_skip_stop"]:
+            return False
+        return self._is_notice(message) or self._is_system_sender(message)
 
     @staticmethod
     def _dedup_key(message) -> str:

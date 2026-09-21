@@ -4,17 +4,21 @@ v1.3.2 起不再默认特殊照顾系统消息，改为两个开关：
 - system_trigger_passthrough（默认关）：触发型系统事件（S版主动回复
   system_proactive_dm / 定时任务 system_scheduled / system_ 前缀 sender）
   撞上在飞轮时不拦截、不判停、不转注入，原样留在批次里放行开新轮。
-  默认关 = 与普通消息一视同仁（走停止词+注入判定）。
-- notice_skip_stop（默认开）：系统提醒类消息（is_notice=True 或
-  message_id=="system_message"，框架 publish_notice 的产物）可注入在飞轮，
-  但永不参与停止词判定。
+  默认关 = 照常走注入判定（可拦进在飞轮）。
+- notice_skip_stop（默认开）：所有 system 来源消息——系统提醒（is_notice=True
+  或 message_id=="system_message"，框架 publish_notice 的产物）与触发型系统
+  事件（system_* sender）——可注入在飞轮，但永不参与停止词判定（v1.3.2 后续
+  扩展：此前只覆盖系统提醒）。
 
-T1 默认配置 + 在飞轮 + system_proactive_dm   -> 一视同仁：被拦截转入流入队列
+T1 默认配置 + 在飞轮 + system_proactive_dm   -> 照常拦截：被转入流入队列
 T2 passthrough 开 + 在飞轮 + system_scheduled  -> 放行：不掐批次、不判停、不入队
 T3 默认 + 在飞轮 + notice 文本含停止词          -> 注入在飞轮且本轮不被停
 T4 notice_skip_stop 关 + 同上 notice           -> 命中停止词停轮（一视同仁）
 T5 默认 + 普通用户消息含停止词                  -> 停轮（不变性对照）
 T6 空闲会话 + 系统触发事件                      -> 放行开新轮（无 run 拦截本就不生效）
+T7 默认 + 在飞轮 + system_proactive_dm 含"停"  -> 拦截转注入队列，但本轮不停
+T8 默认 + 在飞轮 + system_scheduled 含"停止"   -> 拦截转注入队列，但本轮不停
+T9 notice_skip_stop 关 + system_proactive_dm 含"停" -> 命中停止词停轮（开关总控）
 
 Run:  python3 tests/test_system_event.py [plugin_dir]
 """
@@ -108,6 +112,44 @@ async def t6_idle_session_system_trigger_untouched(plugin, sid):
     return not b.is_stopped and not plugin._pending_inject.get(sid)
 
 
+async def t7_default_system_trigger_with_stop_word_injected_not_stops(plugin, sid):
+    """默认（notice_skip_stop 开）：system_proactive_dm 文本含"停"，
+    仍被拦截转入流入队列，但本轮不被停（系统来源消息不触发停止词）。"""
+    ev = batch(FakeMessage("100", "跑个任务"))
+    live_run(plugin, sid, ev)
+    b = batch(FakeMessage("204", "（主动回复提示词：停下手头的事，回复用户）",
+                          uid="system_proactive_dm", nick="系统"))
+    b.messages[0].is_mentioned = True   # 与 S版合成事件一致
+    await drive_on_batch_message(plugin, b)
+    queued = plugin._pending_inject.get(sid, [])
+    return (b.is_stopped and not ev.is_stopped and len(queued) == 1
+            and "停下" in "".join(it[1] for it in queued))
+
+
+async def t8_default_scheduled_with_stop_word_injected_not_stops(plugin, sid):
+    """默认（notice_skip_stop 开）：system_scheduled 文本含"停止"，同上。"""
+    ev = batch(FakeMessage("100", "跑个任务"))
+    live_run(plugin, sid, ev)
+    b = batch(FakeMessage("205", "（定时任务：停止等待，立即执行）",
+                          uid="system_scheduled", nick="系统"))
+    await drive_on_batch_message(plugin, b)
+    queued = plugin._pending_inject.get(sid, [])
+    return (b.is_stopped and not ev.is_stopped and len(queued) == 1
+            and "停止等待" in "".join(it[1] for it in queued))
+
+
+async def t9_notice_skip_stop_off_system_trigger_can_stop(plugin, sid):
+    """notice_skip_stop 关（总控验证）：system_proactive_dm 含"停"命中停止词停轮。"""
+    plugin.notice_skip_stop = False
+    ev = batch(FakeMessage("100", "跑个任务"))
+    live_run(plugin, sid, ev)
+    b = batch(FakeMessage("206", "停", uid="system_proactive_dm", nick="系统"))
+    b.messages[0].is_mentioned = True
+    await drive_on_batch_message(plugin, b)
+    return (b.is_stopped and ev.is_stopped
+            and not plugin._pending_inject.get(sid))
+
+
 SCENARIOS = [
     ("T1 default: system_proactive_dm intercepted like a user message",
      lambda p, s, c: t1_default_system_trigger_intercepted_like_user(p, s)),
@@ -121,6 +163,12 @@ SCENARIOS = [
      lambda p, s, c: t5_user_stop_word_still_stops(p, s)),
     ("T6 idle session: system trigger passes through (no run)",
      lambda p, s, c: t6_idle_session_system_trigger_untouched(p, s)),
+    ("T7 default: system_proactive_dm with stop word injected, run not stopped",
+     lambda p, s, c: t7_default_system_trigger_with_stop_word_injected_not_stops(p, s)),
+    ("T8 default: system_scheduled with stop word injected, run not stopped",
+     lambda p, s, c: t8_default_scheduled_with_stop_word_injected_not_stops(p, s)),
+    ("T9 notice_skip_stop off: system trigger with stop word stops the run",
+     lambda p, s, c: t9_notice_skip_stop_off_system_trigger_can_stop(p, s)),
 ]
 
 
