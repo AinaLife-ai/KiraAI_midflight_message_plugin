@@ -150,18 +150,23 @@ async def case_inject_writes_tuple_and_gc_safe(path):
     await p._track_run_start(ev)
     run_id = getattr(ev, "event_id", None) or SID
 
-    # 第一次工具边界：注入 1 条
+    # 第一次工具边界：注入 1 条（功能断言：文本必须真实搭车进 tool_result）
     ctx.get_buffer(SID).buffer.append(Shim(msg(1002, "中途补充一")))
-    await p._handle_tool_result(ev, _tool())
+    t1 = _tool()
+    await p._handle_tool_result(ev, t1)
     entry = p._run_inject_count.get(run_id)
     assert isinstance(entry, tuple), f"写入必须是元组，实际 {type(entry)}: {entry!r}"
     assert entry[0] == 1, f"第一次注入后计数应为 1，实际 {entry!r}"
+    assert "中途补充一" in t1.text, f"注入文本未真实进入 tool_result: {t1.text!r}"
+    assert "HINT" in t1.text, "引导语应随注入一起进入 tool_result"
 
     # 第二次工具边界：再注入 1 条（读取端 used 走 [0] 下标，int 会在这里炸）
     ctx.get_buffer(SID).buffer.append(Shim(msg(1003, "中途补充二")))
-    await p._handle_tool_result(ev, _tool())
+    t2 = _tool()
+    await p._handle_tool_result(ev, t2)
     entry = p._run_inject_count.get(run_id)
     assert isinstance(entry, tuple) and entry[0] == 2, f"计数应累加到 2，实际 {entry!r}"
+    assert "中途补充二" in t2.text, f"第二次注入文本未进入 tool_result: {t2.text!r}"
 
     # 强制执行 _gc：新鲜条目必须保留，且绝不抛 TypeError
     p._last_gc = 0
@@ -174,19 +179,60 @@ async def case_inject_writes_tuple_and_gc_safe(path):
     p._last_gc = 0
     p._gc()
     assert "stale-run" not in p._run_inject_count, "过期条目应被淘汰"
-
-    # 注入确实搭车到了 tool_result 文本
-    assert "中途补充" in getattr(_tool(), "text", "") or True  # tool 实例不复用，跳过
     await p.terminate()
-    return {"注入写入元组": True, "计数累加": True, "gc安全": True, "过期淘汰": True}
+    return {"注入写入元组": True, "计数累加": True, "注入真实搭车": True,
+            "gc安全": True, "过期淘汰": True}
+
+
+async def case_quota_enforced_with_tuple(path):
+    """配额功能验证：max_inject_per_run=1 时第二条溢出放回 buffer 头、计数不再涨。
+
+    int 事故期间这条链是断的（配额读取 TypeError → 整段注入逻辑被异常吞掉），
+    本用例证明修复后配额统计真实生效而非仅仅不报错。
+    """
+    cfg = {**CFG, "section_limits": {**CFG["section_limits"], "max_inject_per_run": 1}}
+    mod = load(path)
+    ctx = Ctx()
+    p = mod.MidflightMessagePlugin(ctx, cfg)
+    await p.initialize()
+    p.debug = False
+    ctx.plugin = p
+    ev = batch(msg(2001, "跑个任务"))
+    await p._track_run_start(ev)
+    run_id = getattr(ev, "event_id", None) or SID
+
+    # 同一边界塞入 2 条：第 1 条注入、第 2 条溢出放回 buffer 头部
+    buf = ctx.get_buffer(SID)
+    buf.buffer.append(Shim(msg(2002, "第一条")))
+    buf.buffer.append(Shim(msg(2003, "第二条溢出")))
+    t = _tool()
+    await p._handle_tool_result(ev, t)
+    entry = p._run_inject_count.get(run_id)
+    assert isinstance(entry, tuple) and entry[0] == 1, f"配额内只应计 1 条，实际 {entry!r}"
+    assert "第一条" in t.text and "第二条溢出" not in t.text, \
+        f"溢出消息不应进入 tool_result: {t.text!r}"
+    assert len(buf.buffer) == 1 and \
+        getattr(buf.buffer[0].message, "message_id", None) == "2003", \
+        "溢出消息应放回 buffer 头部（保持原顺序）"
+
+    # 下一个边界：配额已用完，buffer 里的消息不再被消费、计数不涨、不抛异常
+    t2 = _tool()
+    await p._handle_tool_result(ev, t2)
+    entry = p._run_inject_count.get(run_id)
+    assert isinstance(entry, tuple) and entry[0] == 1, f"配额用完后计数不应再涨，实际 {entry!r}"
+    assert "第二条溢出" not in t2.text, "配额用完后不应再注入"
+    assert len(buf.buffer) == 1, "未被消费的消息应继续留在 buffer"
+    await p.terminate()
+    return {"配额上限生效": True, "溢出放回buffer": True, "计数封顶": True}
 
 
 async def main():
     path = sys.argv[1] if len(sys.argv) > 1 else str(HERE.parent / "main.py")
     path = str(Path(path) / "main.py") if Path(path).is_dir() else path
-    r = await case_inject_writes_tuple_and_gc_safe(path)
-    for k, v in r.items():
-        print(f"  PASS {k}: {v}")
+    for case in (case_inject_writes_tuple_and_gc_safe, case_quota_enforced_with_tuple):
+        r = await case(path)
+        for k, v in r.items():
+            print(f"  PASS {case.__name__}/{k}: {v}")
     print("test_inject_count: ALL PASS")
     return 0
 
