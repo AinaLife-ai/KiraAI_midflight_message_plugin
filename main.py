@@ -534,7 +534,20 @@ class MidflightMessagePlugin(BasePlugin):
                 native = str(getattr(message, "message_str", "") or "")
                 if not native:
                     chain = getattr(message, "chain", None)
-                    native = await self.ctx.message_processor.message_format_to_text(chain) if chain else text
+                    if chain:
+                        # 双世代：格式化职责在 3.0 迁到 MessageFormatter 服务
+                        # （message_processor.im_workflow.ctx.message_formatter 可达），
+                        # 2.x 在 MessageProcessor.message_format_to_text。
+                        # 逐级 getattr 探测，特征识别不绑版本号。
+                        _wf_ctx = getattr(getattr(getattr(self.ctx, "message_processor", None),
+                                                  "im_workflow", None), "ctx", None)
+                        _formatter = getattr(_wf_ctx, "message_formatter", None)
+                        if _formatter is not None and hasattr(_formatter, "format_to_text"):
+                            native = await _formatter.format_to_text(chain)
+                        else:
+                            native = await self.ctx.message_processor.message_format_to_text(chain)
+                    else:
+                        native = text
             except Exception:
                 native = text
             native = native or text
