@@ -187,6 +187,12 @@ bot:  （下一个工具边界即停止后续步骤，已完成的部分保留�
 <details>
 <summary><b>更新日志</b>（点击展开）</summary>
 
+### v1.3.6
+
+- **3.0 兼容：buffer 路径消息文本化双形态化**——3.0 起 `MessageProcessor.message_format_to_text` 已移除（格式化职责迁到 `MessageFormatter` 服务），旧调用被外层 except 吞掉，buffer 路径的流入消息静默丢失渲染结果（媒体 caption 等）。现逐级探测 3.0 格式化服务（`MessageFormatter.format_to_text`，异步），探测不到回退 2.x 路径；2.x 探测链返回空走原路径，行为零变化
+- 兼容性节补 3.0 全系列声明与本次改动说明
+- 版本 v1.3.5 → v1.3.6
+
 ### v1.3.5
 
 - **修复 3.0 框架上「拦截消息还原后 flush 失败」（线上实测复现）**：批次拦截路径用 `_BufferedMsgShim` 把批次消息包装成 buffer 事件形状，还原回 SessionBuffer 后由框架 `flush_session_messages` 重新成批——但 shim 只暴露了旧字段名 `message_types`，而 **3.0（dev-v3）的 `core/message_manager.py` 改读 `last_event.supported_elements`**（字段改名），shim 作为缓冲里最后一条事件时直接 `AttributeError`，日志表现为 `还原消息回 buffer 异常（已自捕获）`。消息在异常前已放回 buffer（**不丢**），但 flush 没执行——用户不再说话就一直滞留，等不到下一轮。2.x 读的是 `message_types`，不受影响。修复：shim 构造时**先取新名 `supported_elements`、回退旧名 `message_types`，两个名字都暴露**——2.x / 3.0 的 flush 都能读到，且 3.0 上不再触碰 deprecated 别名
