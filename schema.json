@@ -111,6 +111,12 @@
         "name": "允许触发停止的用户ID",
         "hint": "填用户ID（user_id），仅在上方白名单开启时生效。和「范围与白名单」里的流入白名单互不影响，独立控制。"
       },
+      "notice_always_inject": {
+        "type": "switch",
+        "default": false,
+        "name": "系统通知总是可注入",
+        "hint": "**默认关**（保持「系统事件默认一视同仁」的设计：通知照常走流入判定）。打开后，系统通知类消息（is_notice=True 或 message_id==\"system_message\"，即框架 publish_notice 的产物——子代理任务结果、S/Z 的骚扰与休眠提醒等）直接视为可注入，可在运行中的下一个工具边界被看到，而不必等本轮 step/final。关闭时行为与旧版完全一致"
+      },
       "notice_skip_stop": {
         "type": "switch",
         "default": true,

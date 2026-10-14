@@ -78,7 +78,7 @@ OVERRIDABLE_KEYS = {
     "freshness_seconds", "max_length", "block_patterns", "template",
     "inject_hint", "inject_hint_text", "inject_timeout_steps",
     "inject_grace_seconds", "debug",
-    "system_trigger_passthrough", "notice_skip_stop",
+    "system_trigger_passthrough", "notice_skip_stop", "notice_always_inject",
 }
 
 
@@ -178,6 +178,12 @@ class MidflightMessagePlugin(BasePlugin):
         # 永不参与停止词判定，但仍照常走注入过滤可以流入在飞轮。关掉则一视同仁
         # 可触发停止。
         self.notice_skip_stop = bool(stop.get("notice_skip_stop", True))
+        # 系统通知类消息（publish_notice 产物：is_notice / message_id=="system_message"）
+        # 是否**总是可注入**。**默认关** —— 保持 v1.3.2 的设计决定「系统事件豁免改为配置化、
+        # 默认一视同仁」：通知照常走 flow_method / 白名单 / 新鲜度 / 黑名单判定，不被赦免。
+        # 打开后，通知（子代理结果、S/Z 骚扰/休眠提醒等）直接进入流入队列，可在运行中的
+        # 下一个工具边界被注入，而不必等本轮 step/final（或卡死兜底）。
+        self.notice_always_inject = bool(stop.get("notice_always_inject", False))
 
         scope = cfg.get("section_scope", {}) or {}
         self.session_blacklist = [str(s) for s in (scope.get("session_blacklist") or []) if str(s).strip()]
@@ -1198,6 +1204,21 @@ class MidflightMessagePlugin(BasePlugin):
         if message is None:
             return False
 
+        # ⓪ 可选的「系统通知总是可注入」（`notice_always_inject`，**默认关**）。
+        #
+        #    ⚠ 默认关是**有意为之**：v1.3.2 起本插件的设计决定是「系统事件豁免配置化、
+        #    默认一视同仁」——系统通知也照常走流入判定（flow_method / 白名单 / 新鲜度 /
+        #    黑名单），不搞特例。因此这里只在该开关被显式打开时才放行。
+        #
+        #    什么时候值得打开：需要通知（子代理任务结果、S/Z 的骚扰/休眠提醒）在**运行中**
+        #    就于下一个工具边界被看到，而不是等本轮 step / final。关闭时行为与 v1.3.6 完全一致。
+        #
+        #    放行后的边界不变：仍然只进本插件的流入队列（会话黑名单、插件总开关、
+        #    单轮流入条数上限、`_dedup_key` 去重、停止词判定全部照旧生效）。
+        if cfg.get("notice_always_inject", False) and self._is_notice(message):
+            self._log_debug("系统通知类消息直接进入流入判定（notice_always_inject）")
+            return True
+
         # 白名单（默认关）
         if cfg["whitelist_enabled"]:
             sender_id = str(getattr(getattr(message, "sender", None), "user_id", "") or "")
@@ -1360,6 +1381,7 @@ class MidflightMessagePlugin(BasePlugin):
             "inject_grace_seconds": self.inject_grace_seconds,
             "system_trigger_passthrough": self.system_trigger_passthrough,
             "notice_skip_stop": self.notice_skip_stop,
+            "notice_always_inject": self.notice_always_inject,
             "debug": self.debug,
             "allow_record": self.allow_record,
             "allow_image": self.allow_image,
